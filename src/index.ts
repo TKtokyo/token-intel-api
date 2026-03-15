@@ -14,10 +14,21 @@ import { tokenRoutes } from "./routes/token.js";
 
 const app = new Hono<{ Bindings: Env }>();
 
-// Error handler for debugging
+// Security headers middleware (audit P0 #2)
+app.use("*", async (c, next) => {
+  await next();
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("Cache-Control", "no-store");
+  c.header("X-Frame-Options", "DENY");
+});
+
+// Error handler — generic message only (audit P0 #1)
 app.onError((err, c) => {
   console.error("Unhandled error:", err.message, err.stack);
-  return c.json({ error: "internal_error", message: err.message }, 500);
+  return c.json(
+    { error: "internal_error", message: "An unexpected error occurred." },
+    500,
+  );
 });
 
 // Health check (unprotected)
