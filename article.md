@@ -29,7 +29,7 @@ GET /api/v1/token/1/0x6982508145454Ce325dDbE47a25d4ec3d2311933
 
 1リクエスト $0.005。変動費ゼロ（Cloudflare Workers + GoPlus無料枠）なので粗利率100%。
 
-**ライブURL（テストネット）：** `https://token-intel-api.tatsu77.workers.dev`
+**ライブURL（Base mainnet）：** `https://token-intel-api.tatsu77.workers.dev`
 
 ---
 
@@ -91,7 +91,7 @@ app.use("/api/v1/*", async (c, next) => {
     "GET /api/v1/token/*/*": {
       accepts: {
         scheme: "exact",
-        network: "eip155:84532",  // Base Sepolia
+        network: "eip155:8453",  // Base mainnet
         price: "$0.005",
         payTo: c.env.PAY_TO_ADDRESS as `0x${string}`,
       },
@@ -282,21 +282,21 @@ const routes = {
 
 ---
 
-## メインネット移行
+## メインネット構成
 
-テストネット（Base Sepolia）からメインネット（Base）への切り替えは、`@coinbase/x402` パッケージが提供する `createFacilitatorConfig` を使う。
+本番環境はBase mainnetで稼働している。`@coinbase/x402` パッケージが提供する `createFacilitatorConfig` でCDP Facilitatorに接続する。
 
 ```typescript
 import { createFacilitatorConfig } from "@coinbase/x402";
 
-// CDP API キーがあればメインネット facilitator を使う
+// CDP API キーでメインネット facilitator を使う
 if (c.env.CDP_API_KEY_ID && c.env.CDP_API_KEY_SECRET) {
   facilitatorConfig = createFacilitatorConfig(
     c.env.CDP_API_KEY_ID,
     c.env.CDP_API_KEY_SECRET,
   );
 } else {
-  // テストネット（認証不要）
+  // フォールバック（テスト用）
   facilitatorConfig = { url: c.env.FACILITATOR_URL };
 }
 ```
@@ -304,15 +304,15 @@ if (c.env.CDP_API_KEY_ID && c.env.CDP_API_KEY_SECRET) {
 `wrangler.toml` で環境を分離：
 
 ```toml
-# デフォルト: テストネット
+# デフォルト: production（Base mainnet）
 [vars]
-FACILITATOR_URL = "https://www.x402.org/facilitator"
-X402_NETWORK = "eip155:84532"
-
-# メインネット
-[env.production.vars]
 FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402"
 X402_NETWORK = "eip155:8453"
+
+# テスト用（Base Sepolia）
+[env.testnet.vars]
+FACILITATOR_URL = "https://www.x402.org/facilitator"
+X402_NETWORK = "eip155:84532"
 ```
 
 ---
@@ -338,7 +338,7 @@ X402_NETWORK = "eip155:8453"
 
 - **導入の手軽さ：** ミドルウェア1つでAPIを有料化できる
 - **サーバー側の秘密鍵管理不要：** 受取アドレスだけ設定すればFacilitatorが決済処理
-- **テストネットが充実：** Base Sepolia + Circle Faucetで無料テスト
+- **テストネットも利用可能：** Base Sepolia + Circle Faucetで無料テスト可能
 - **SDK がTypeScript完備：** サーバー側もクライアント側も型安全
 
 ### 改善の余地
@@ -356,7 +356,7 @@ x402は「HTTPネイティブな課金」という長年の夢を現実にして
 一方で、SDKのドキュメントとの差異や、決済レイテンシなど、プロダクション利用には注意点もある。この記事がこれからx402でAPIを作る人の参考になれば幸いだ。
 
 **リポジトリ：** [GitHub](https://github.com/TKtokyo/token-intel-api)
-**ライブAPI（テストネット）：** `https://token-intel-api.tatsu77.workers.dev`
+**ライブAPI（Base mainnet）：** `https://token-intel-api.tatsu77.workers.dev`
 
 ---
 
