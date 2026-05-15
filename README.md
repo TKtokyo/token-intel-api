@@ -2,7 +2,7 @@
 
 x402-powered paid API that returns security analysis, deterministic risk scores, and natural language summaries for any EVM token.
 
-**Live (testnet):** `https://token-intel-api.tatsu77.workers.dev`
+**Live (mainnet):** `https://token-intel-api.tatsu77.workers.dev`
 
 ## How It Works
 
@@ -19,7 +19,7 @@ One HTTP request, one microtransaction ($0.005 USDC), one structured response.
 
 ### `GET /api/v1/token/{chainId}/{address}`
 
-**Payment:** $0.005 USDC via x402 protocol (Base Sepolia testnet)
+**Payment:** $0.005 USDC via x402 protocol on Base mainnet
 
 **Path parameters:**
 | Parameter | Description |
@@ -81,9 +81,55 @@ One HTTP request, one microtransaction ($0.005 USDC), one structured response.
 | 429 | `upstream_throttled` | GoPlus rate limited (retry in 30s) |
 | 503 | `upstream_unavailable` | GoPlus API down |
 
+### `POST /api/v1/tokens`
+
+Batch analysis of up to 10 EVM tokens in a single request.
+
+**Payment:** $0.020 USDC via x402 protocol on Base mainnet
+
+**Request body:**
+
+```json
+{
+  "tokens": [
+    { "chainId": "1", "address": "0x6982508145454Ce325dDbE47a25d4ec3d2311933" },
+    { "chainId": "8453", "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" }
+  ]
+}
+```
+
+| Field | Constraint |
+|---|---|
+| `tokens` | Array of 1–10 token entries |
+| `tokens[].chainId` | `1` (Ethereum) or `8453` (Base) |
+| `tokens[].address` | ERC-20 contract address (`^0x[a-fA-F0-9]{40}$`) |
+
+Internally each token is analysed concurrently (parallelism 3) under an 8-second deadline. Each result carries an independent status so a partial failure does not fail the whole batch.
+
+**Response (200):**
+
+```json
+{
+  "results": [
+    { "chainId": "1", "address": "0x6982...", "status": "success", "data": { /* same shape as GET /token */ } },
+    { "chainId": "8453", "address": "0x8335...", "status": "not_found", "error": "No security data available for this token." }
+  ],
+  "total": 2,
+  "succeeded": 1,
+  "failed": 1,
+  "partial": true
+}
+```
+
+Per-item `status` is one of `success`, `not_found`, `error`. Top-level status codes: `200` (full or partial success — inspect per-item status), `400` (invalid body), `402` (payment required).
+
 ### `GET /health`
 
 Returns `{ "status": "ok", "version": "0.1.0" }`. No payment required.
+
+### `GET /.well-known/x402` / `GET /openapi.json` / `GET /llms.txt`
+
+Free discovery endpoints. The x402 manifest emits the standard `resources[]` array (DiscoveryResource schema) so x402scan and other bazaar consumers can register both paid endpoints.
 
 ## Risk Scoring
 
@@ -108,10 +154,10 @@ import { registerExactEvmScheme } from "@x402/evm/exact/client";
 import { toClientEvmSigner } from "@x402/evm";
 import { privateKeyToAccount } from "viem/accounts";
 import { createPublicClient, http } from "viem";
-import { baseSepolia } from "viem/chains";
+import { base } from "viem/chains";
 
 const account = privateKeyToAccount("0xYOUR_PRIVATE_KEY");
-const publicClient = createPublicClient({ chain: baseSepolia, transport: http() });
+const publicClient = createPublicClient({ chain: base, transport: http() });
 const signer = toClientEvmSigner(account, publicClient);
 
 const client = new x402Client();
@@ -125,7 +171,7 @@ const data = await res.json();
 console.log(data.risk_score, data.risk_level, data.summary);
 ```
 
-**Prerequisites:** Test USDC on Base Sepolia from [Circle Faucet](https://faucet.circle.com).
+**Prerequisites:** USDC on Base mainnet in the signing account (any standard onramp / bridge). The signer also needs a small amount of ETH on Base to ensure transactions can be processed.
 
 ## Development
 

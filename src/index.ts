@@ -15,6 +15,274 @@ import { tokensRoutes } from "./routes/tokens.js";
 import { handleMcpRequest } from "./mcp/server.js";
 import { OPENAPI_SPEC } from "./openapi.js";
 
+// ─── Token route definitions (single source of truth) ──────────────────────
+//
+// TOKEN_ROUTES drives both the payment middleware and the .well-known/x402
+// manifest, so the route URLs, prices, and discovery metadata cannot drift.
+// `buildAccepts` produces the same PaymentRequirements that the @x402/hono
+// middleware emits in the PAYMENT-REQUIRED header, ensuring x402scan and any
+// other consumer sees identical accepts[] from both sources.
+
+interface TokenRouteDef {
+  method: "GET" | "POST";
+  middlewarePattern: string; // pattern consumed by paymentMiddleware
+  resourcePath: string;       // concrete path embedded in manifest resource URL
+  price: string;              // USD form consumed by paymentMiddleware (e.g. "$0.005")
+  resourceName: string;
+  description: string;
+  bodyType?: "json" | "form-data" | "text"; // required for POST/PUT/PATCH
+  inputExample: Record<string, unknown>;
+  inputSchema: Record<string, unknown>;
+  outputExample: unknown;
+  outputSchema: Record<string, unknown>;
+}
+
+// PEPE on Ethereum mainnet — used as the concrete sample in the manifest
+// URL so x402scan validation hits a real path that returns 402.
+const PEPE_ADDRESS = "0x6982508145454Ce325dDbE47a25d4ec3d2311933";
+// USDC on Base mainnet — second sample for the batch endpoint example.
+const BASE_USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+
+const TOKEN_ROUTES: Record<string, TokenRouteDef> = {
+  "/api/v1/token/{chainId}/{address}": {
+    method: "GET",
+    middlewarePattern: "GET /api/v1/token/*/*",
+    resourcePath: `/api/v1/token/1/${PEPE_ADDRESS}`,
+    price: "$0.005",
+    resourceName: "EVM Token Intelligence Report",
+    description:
+      "Security analysis, deterministic risk score, and natural language summary for any EVM token",
+    inputExample: { chainId: "1", address: PEPE_ADDRESS },
+    inputSchema: {
+      properties: {
+        chainId: {
+          type: "string",
+          enum: ["1", "8453"],
+          description: "Chain ID (1 = Ethereum, 8453 = Base)",
+        },
+        address: {
+          type: "string",
+          pattern: "^0x[a-fA-F0-9]{40}$",
+          description: "ERC-20 token contract address",
+        },
+      },
+      required: ["chainId", "address"],
+    },
+    outputExample: {
+      token: {
+        name: "Pepe",
+        symbol: "PEPE",
+        chain_id: "1",
+        address: PEPE_ADDRESS.toLowerCase(),
+        total_supply: "420690000000000000000000000000000",
+      },
+      security: {
+        is_honeypot: false,
+        is_open_source: true,
+        is_proxy: false,
+        is_mintable: false,
+      },
+      risk_score: 85,
+      risk_level: "LOW",
+      summary:
+        "LOW risk. Contract is open source, verified. No honeypot detected.",
+      cached: false,
+      data_age_seconds: 0,
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        token: { type: "object" },
+        security: { type: "object" },
+        holders: { type: "object" },
+        liquidity: { type: "object" },
+        risk_score: {
+          type: "number",
+          minimum: 0,
+          maximum: 100,
+          description: "Risk score (0 = critical, 100 = safest)",
+        },
+        risk_level: {
+          type: "string",
+          enum: ["CRITICAL", "HIGH", "MODERATE", "LOW"],
+        },
+        summary: { type: "string" },
+        cached: { type: "boolean" },
+        data_age_seconds: { type: "number" },
+      },
+      required: [
+        "token",
+        "security",
+        "holders",
+        "liquidity",
+        "risk_score",
+        "risk_level",
+        "summary",
+      ],
+    },
+  },
+  "/api/v1/tokens": {
+    method: "POST",
+    middlewarePattern: "POST /api/v1/tokens",
+    resourcePath: "/api/v1/tokens",
+    price: "$0.020",
+    bodyType: "json",
+    resourceName: "Batch EVM Token Intelligence Report",
+    description:
+      "Batch security analysis for up to 10 EVM tokens in a single request",
+    inputExample: {
+      tokens: [
+        { chainId: "1", address: PEPE_ADDRESS },
+        { chainId: "8453", address: BASE_USDC_ADDRESS },
+      ],
+    },
+    inputSchema: {
+      properties: {
+        tokens: {
+          type: "array",
+          minItems: 1,
+          maxItems: 10,
+          description: "Array of tokens to analyse (max 10 per request)",
+          items: {
+            type: "object",
+            properties: {
+              chainId: {
+                type: "string",
+                enum: ["1", "8453"],
+                description: "Chain ID (1 = Ethereum, 8453 = Base)",
+              },
+              address: {
+                type: "string",
+                pattern: "^0x[a-fA-F0-9]{40}$",
+                description: "ERC-20 token contract address",
+              },
+            },
+            required: ["chainId", "address"],
+          },
+        },
+      },
+      required: ["tokens"],
+    },
+    outputExample: {
+      results: [
+        {
+          chainId: "1",
+          address: PEPE_ADDRESS.toLowerCase(),
+          status: "success",
+          data: {
+            token: { name: "Pepe", symbol: "PEPE", chain_id: "1" },
+            risk_score: 85,
+            risk_level: "LOW",
+          },
+        },
+        {
+          chainId: "8453",
+          address: BASE_USDC_ADDRESS.toLowerCase(),
+          status: "success",
+          data: {
+            token: { name: "USD Coin", symbol: "USDC", chain_id: "8453" },
+            risk_score: 95,
+            risk_level: "LOW",
+          },
+        },
+      ],
+      total: 2,
+      succeeded: 2,
+      failed: 0,
+      partial: false,
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        results: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              chainId: { type: "string" },
+              address: { type: "string" },
+              status: {
+                type: "string",
+                enum: ["success", "not_found", "error"],
+              },
+              data: { type: "object" },
+              error: { type: "string" },
+            },
+            required: ["chainId", "address", "status"],
+          },
+        },
+        total: { type: "number" },
+        succeeded: { type: "number" },
+        failed: { type: "number" },
+        partial: { type: "boolean" },
+      },
+      required: ["results", "total", "succeeded", "failed", "partial"],
+    },
+  },
+};
+
+interface UsdcInfo {
+  address: string;
+  name: string;
+  version: string;
+}
+
+// USDC contract metadata per supported network. Values must match what
+// @x402/hono resolves on-chain, so the manifest's accepts[] is byte-identical
+// to the middleware-emitted PAYMENT-REQUIRED payload.
+const USDC_BY_NETWORK: Record<string, UsdcInfo> = {
+  "eip155:8453": {
+    address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    name: "USD Coin",
+    version: "2",
+  },
+  "eip155:84532": {
+    address: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    name: "USDC",
+    version: "2",
+  },
+};
+
+// "$0.020" -> "20000" (USDC has 6 decimals). BigInt-based so no float drift.
+function usdToUsdcBaseUnits(price: string): string {
+  const match = /^\$(\d+)(?:\.(\d{1,6}))?$/.exec(price);
+  if (!match) throw new Error(`Invalid price format: ${price}`);
+  const whole = BigInt(match[1]);
+  const frac = (match[2] ?? "").padEnd(6, "0");
+  return (whole * 1_000_000n + BigInt(frac || "0")).toString();
+}
+
+interface PaymentRequirement {
+  scheme: "exact";
+  network: string;
+  amount: string;
+  asset: string;
+  payTo: string;
+  maxTimeoutSeconds: number;
+  extra: { name: string; version: string };
+}
+
+function buildAccepts(price: string, env: Env): PaymentRequirement[] {
+  const usdc = USDC_BY_NETWORK[env.X402_NETWORK];
+  if (!usdc) {
+    throw new Error(`Unsupported X402_NETWORK: ${env.X402_NETWORK}`);
+  }
+  return [
+    {
+      scheme: "exact",
+      network: env.X402_NETWORK,
+      amount: usdToUsdcBaseUnits(price),
+      asset: usdc.address,
+      payTo: env.PAY_TO_ADDRESS,
+      maxTimeoutSeconds: 300,
+      extra: { name: usdc.name, version: usdc.version },
+    },
+  ];
+}
+
+// Bumped when the route schema, pricing, or sample addresses change.
+const RESOURCES_LAST_UPDATED = "2026-05-15T00:00:00Z";
+
 const app = new Hono<{ Bindings: Env }>();
 
 // Security headers middleware (audit P0 #2)
@@ -71,14 +339,17 @@ app.get("/llms.txt", (c) => {
   const body = `# Token Intel API
 > EVM token security analysis with deterministic risk scoring and natural language summaries via x402 micropayments.
 
-## Endpoint
-- POST /api/v1/token/{chainId}/{address} — Analyze any EVM token (requires x402 payment)
+## Endpoints
+- GET /api/v1/token/{chainId}/{address} — Analyze a single EVM token ($0.005 USDC, x402)
+- POST /api/v1/tokens — Batch-analyze up to 10 EVM tokens in one request ($0.020 USDC, x402)
 
-## Pricing
-- $0.005 USDC per request on Base mainnet
+Both paid endpoints run on Base mainnet. chainId is "1" (Ethereum) or "8453" (Base); address is the ERC-20 contract.
 
 ## Machine-readable API spec
 - OpenAPI 3.0: https://token-intel-api.tatsu77.workers.dev/openapi.json
+
+## Discovery
+- x402 manifest: https://token-intel-api.tatsu77.workers.dev/.well-known/x402
 
 ## MCP
 - Streamable HTTP: https://token-intel-api.tatsu77.workers.dev/mcp
@@ -89,29 +360,35 @@ app.get("/llms.txt", (c) => {
   });
 });
 
-// x402 discovery (unprotected)
+// x402 discovery (unprotected). Emits the standard `resources` array used
+// by x402scan and other bazaar consumers. Each entry's accepts[] is
+// produced by the same `buildAccepts` helper used by `unpaidResponseBody`,
+// so the manifest and the 402 response stay byte-identical.
 app.get("/.well-known/x402", (c) => {
+  const baseUrl = new URL(c.req.url).origin;
+  const resources = Object.values(TOKEN_ROUTES).map((route) => ({
+    resource: `${baseUrl}${route.resourcePath}`,
+    type: "http",
+    x402Version: 2,
+    accepts: buildAccepts(route.price, c.env),
+    lastUpdated: RESOURCES_LAST_UPDATED,
+    metadata: {
+      method: route.method,
+      name: route.resourceName,
+      description: route.description,
+      inputSchema: route.inputSchema,
+      outputExample: route.outputExample,
+    },
+  }));
+
   return c.json(
     {
       x402Version: 1,
-      resourceServer: "https://token-intel-api.tatsu77.workers.dev",
-      facilitator: "https://api.cdp.coinbase.com/platform/v2/x402",
-      network: "eip155:8453",
-      openapi: "https://token-intel-api.tatsu77.workers.dev/openapi.json",
-      endpoints: [
-        {
-          path: "/api/v1/token/{chainId}/{address}",
-          method: "GET",
-          price: "$0.005",
-          asset: "USDC",
-        },
-        {
-          path: "/api/v1/tokens",
-          method: "POST",
-          price: "$0.020",
-          asset: "USDC",
-        },
-      ],
+      resourceServer: baseUrl,
+      facilitator: c.env.FACILITATOR_URL,
+      network: c.env.X402_NETWORK,
+      openapi: `${baseUrl}/openapi.json`,
+      resources,
     },
     200,
     { "Access-Control-Allow-Origin": "*" },
@@ -146,106 +423,57 @@ app.use("/api/v1/*", async (c, next) => {
   registerExactEvmScheme(server);
   server.registerExtension(bazaarResourceServerExtension);
 
-  const routes: RoutesConfig = {
-    "GET /api/v1/token/*/*": {
+  const network = c.env.X402_NETWORK as `eip155:${string}`;
+  const payTo = c.env.PAY_TO_ADDRESS as `0x${string}`;
+
+  const routes: RoutesConfig = {};
+  for (const route of Object.values(TOKEN_ROUTES)) {
+    const accepts = buildAccepts(route.price, c.env);
+    routes[route.middlewarePattern] = {
       accepts: {
         scheme: "exact",
-        network: c.env.X402_NETWORK as `eip155:${string}`,
-        price: "$0.005",
-        payTo: c.env.PAY_TO_ADDRESS as `0x${string}`,
+        network,
+        price: route.price,
+        payTo,
       },
-      resource: "Token Intelligence Report",
-      description:
-        "Security analysis + risk score + summary for any EVM token",
+      resource: route.resourceName,
+      description: route.description,
       mimeType: "application/json",
       extensions: {
-        ...declareDiscoveryExtension({
-          input: { chainId: "1", address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" },
-          inputSchema: {
-            properties: {
-              chainId: {
-                type: "string",
-                enum: ["1", "8453"],
-                description: "Chain ID (1 = Ethereum, 8453 = Base)",
-              },
-              address: {
-                type: "string",
-                pattern: "^0x[a-fA-F0-9]{40}$",
-                description: "ERC-20 token contract address",
-              },
-            },
-            required: ["chainId", "address"],
-          },
-          output: {
-            example: {
-              token: {
-                name: "USD Coin",
-                symbol: "USDC",
-                chain_id: "1",
-                address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-                total_supply: "25000000000000000",
-              },
-              security: {
-                is_honeypot: false,
-                is_open_source: true,
-                is_proxy: true,
-                is_mintable: false,
-              },
-              risk_score: 80,
-              risk_level: "LOW",
-              summary:
-                "LOW risk. Contract is open source, verified. No honeypot detected.",
-              cached: false,
-              data_age_seconds: 0,
-            },
-            schema: {
-              type: "object",
-              properties: {
-                token: { type: "object" },
-                security: { type: "object" },
-                holders: { type: "object" },
-                liquidity: { type: "object" },
-                risk_score: {
-                  type: "number",
-                  minimum: 0,
-                  maximum: 100,
-                  description: "Risk score (0 = critical, 100 = safest)",
+        ...declareDiscoveryExtension(
+          route.bodyType
+            ? {
+                input: route.inputExample,
+                inputSchema: route.inputSchema,
+                bodyType: route.bodyType,
+                output: {
+                  example: route.outputExample,
+                  schema: route.outputSchema,
                 },
-                risk_level: {
-                  type: "string",
-                  enum: ["CRITICAL", "HIGH", "MODERATE", "LOW"],
+              }
+            : {
+                input: route.inputExample,
+                inputSchema: route.inputSchema,
+                output: {
+                  example: route.outputExample,
+                  schema: route.outputSchema,
                 },
-                summary: { type: "string" },
-                cached: { type: "boolean" },
-                data_age_seconds: { type: "number" },
               },
-              required: [
-                "token",
-                "security",
-                "holders",
-                "liquidity",
-                "risk_score",
-                "risk_level",
-                "summary",
-              ],
-            },
-          },
-        }),
+        ),
       },
-    },
-    "POST /api/v1/tokens": {
-      accepts: {
-        scheme: "exact",
-        network: c.env.X402_NETWORK as `eip155:${string}`,
-        price: "$0.020",
-        payTo: c.env.PAY_TO_ADDRESS as `0x${string}`,
-      },
-      resource: "Batch Token Intelligence Report",
-      description:
-        "Batch security analysis for up to 10 EVM tokens in one request",
-      mimeType: "application/json",
-    },
-  };
+      // Mirror accepts[] into the 402 body so callers that only read JSON
+      // (e.g. x402scan validators, naive curl checks) see the same payment
+      // requirements they would otherwise pull from PAYMENT-REQUIRED header.
+      unpaidResponseBody: () => ({
+        contentType: "application/json",
+        body: {
+          x402Version: 1,
+          accepts,
+          error: "X-PAYMENT header is required",
+        },
+      }),
+    };
+  }
 
   const middleware = paymentMiddleware(routes, server);
   return middleware(c, next);
