@@ -11,6 +11,9 @@ import type { RoutesConfig } from "@x402/core/server";
 import type { FacilitatorConfig } from "@x402/core/http";
 import type { Env } from "./types/index.js";
 import { tokenRoutes } from "./routes/token.js";
+import { tokensRoutes } from "./routes/tokens.js";
+import { handleMcpRequest } from "./mcp/server.js";
+import { OPENAPI_SPEC } from "./openapi.js";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -34,8 +37,98 @@ app.onError((err, c) => {
 // Health check (unprotected)
 app.get("/health", (c) => c.json({ status: "ok", version: "0.1.0" }));
 
+// API info
+app.get("/", (c) =>
+  c.json({
+    name: "Token Intelligence API",
+    version: "0.1.0",
+    description: "EVM token security analysis via x402 micropayments",
+    endpoints: {
+      single: "GET /api/v1/token/{chainId}/{address}",
+      batch: "POST /api/v1/tokens",
+    },
+    price: { single: "$0.005", batch: "$0.020" },
+    example: "/api/v1/token/1/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    x402: true,
+    mcp: {
+      endpoint: "/mcp",
+      transport: "streamable-http",
+      tools: ["analyze_token"],
+    },
+  }),
+);
+
+// OpenAPI spec (unprotected)
+app.get("/openapi.json", (c) => {
+  return c.json(OPENAPI_SPEC, 200, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+  });
+});
+
+// llms.txt (unprotected)
+app.get("/llms.txt", (c) => {
+  const body = `# Token Intel API
+> EVM token security analysis with deterministic risk scoring and natural language summaries via x402 micropayments.
+
+## Endpoint
+- POST /api/v1/token/{chainId}/{address} — Analyze any EVM token (requires x402 payment)
+
+## Pricing
+- $0.005 USDC per request on Base mainnet
+
+## Machine-readable API spec
+- OpenAPI 3.0: https://token-intel-api.tatsu77.workers.dev/openapi.json
+
+## MCP
+- Streamable HTTP: https://token-intel-api.tatsu77.workers.dev/mcp
+`;
+  return c.text(body, 200, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Access-Control-Allow-Origin": "*",
+  });
+});
+
+// x402 discovery (unprotected)
+app.get("/.well-known/x402", (c) => {
+  return c.json(
+    {
+      x402Version: 1,
+      resourceServer: "https://token-intel-api.tatsu77.workers.dev",
+      facilitator: "https://api.cdp.coinbase.com/platform/v2/x402",
+      network: "eip155:8453",
+      openapi: "https://token-intel-api.tatsu77.workers.dev/openapi.json",
+      endpoints: [
+        {
+          path: "/api/v1/token/{chainId}/{address}",
+          method: "GET",
+          price: "$0.005",
+          asset: "USDC",
+        },
+        {
+          path: "/api/v1/tokens",
+          method: "POST",
+          price: "$0.020",
+          asset: "USDC",
+        },
+      ],
+    },
+    200,
+    { "Access-Control-Allow-Origin": "*" },
+  );
+});
+
+// MCP server endpoint (discovery-only — no data, no upstream calls)
+app.all("/mcp", async (c) => {
+  return handleMcpRequest(c.req.raw);
+});
+
 // x402 payment middleware — wraps protected routes
 app.use("/api/v1/*", async (c, next) => {
+  // Skip paywall in local dev when DISABLE_PAYWALL is set
+  if (c.env.DISABLE_PAYWALL === "true") {
+    return next();
+  }
   // Use CDP facilitator config when keys are available (mainnet),
   // otherwise use simple URL config (testnet)
   let facilitatorConfig: FacilitatorConfig;
@@ -140,13 +233,26 @@ app.use("/api/v1/*", async (c, next) => {
         }),
       },
     },
+    "POST /api/v1/tokens": {
+      accepts: {
+        scheme: "exact",
+        network: c.env.X402_NETWORK as `eip155:${string}`,
+        price: "$0.020",
+        payTo: c.env.PAY_TO_ADDRESS as `0x${string}`,
+      },
+      resource: "Batch Token Intelligence Report",
+      description:
+        "Batch security analysis for up to 10 EVM tokens in one request",
+      mimeType: "application/json",
+    },
   };
 
   const middleware = paymentMiddleware(routes, server);
   return middleware(c, next);
 });
 
-// Protected route
+// Protected routes
 app.route("/api/v1/token", tokenRoutes);
+app.route("/api/v1/tokens", tokensRoutes);
 
 export default app;

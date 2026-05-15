@@ -6,7 +6,12 @@ import type {
   SecurityInfo,
   HolderInfo,
   LiquidityInfo,
+  TokenIntelResponse,
+  TokenSecurityResult,
 } from "../types/index.js";
+import { calculateRiskScore } from "./scoring.js";
+import { generateSummary } from "./summary.js";
+import { cacheGet, cachePut, cacheNegativePut } from "./cache.js";
 
 const GOPLUS_BASE = "https://api.gopluslabs.io/api/v1/token_security";
 
@@ -152,4 +157,80 @@ export function mapLiquidityInfo(data: GoPlusTokenData): LiquidityInfo {
     lp_total_supply: data.lp_total_supply || "0",
     is_lp_locked: isAnyLpLocked(data),
   };
+}
+
+/**
+ * Full pipeline: cache check → GoPlus fetch → map → score → summarize → cache write.
+ * Shared by single GET and batch POST endpoints.
+ */
+export async function fetchTokenSecurity(
+  chainId: string,
+  address: string,
+  apiKey: string | undefined,
+  kv: KVNamespace,
+  waitUntil?: (p: Promise<unknown>) => void,
+): Promise<TokenSecurityResult> {
+  const normalizedAddress = address.toLowerCase();
+
+  // --- Cache read ---
+  const cached = await cacheGet(kv, chainId, normalizedAddress);
+  if (cached.hit) {
+    if ("negative" in cached) {
+      return { status: "rate_limited" };
+    }
+    return {
+      status: "success",
+      data: { ...cached.entry.data, cached: true, data_age_seconds: cached.ageSeconds },
+    };
+  }
+
+  // --- Fetch from GoPlus ---
+  const result = await fetchGoPlus(chainId, normalizedAddress, apiKey);
+
+  if (result.status === "rate_limited") {
+    await cacheNegativePut(kv, chainId, normalizedAddress, "rate_limited");
+    return { status: "rate_limited" };
+  }
+
+  if (result.status === "error") {
+    if (result.httpStatus >= 500 || result.httpStatus === 0) {
+      await cacheNegativePut(kv, chainId, normalizedAddress, `error_${result.httpStatus}`);
+    }
+    return { status: "error", message: result.message || "upstream_unavailable" };
+  }
+
+  if (result.status === "not_found") {
+    return { status: "not_found" };
+  }
+
+  // --- Build response ---
+  const data = result.data;
+  const token = mapTokenInfo(data, chainId, normalizedAddress);
+  const security = mapSecurityInfo(data);
+  const holders = mapHolderInfo(data);
+  const liquidity = mapLiquidityInfo(data);
+  const { score, level, factors } = calculateRiskScore(data);
+  const summary = generateSummary(score, level, factors, data);
+
+  const response: TokenIntelResponse = {
+    token,
+    security,
+    holders,
+    liquidity,
+    risk_score: score,
+    risk_level: level,
+    summary,
+    cached: false,
+    data_age_seconds: 0,
+  };
+
+  // --- Cache write (non-blocking if waitUntil provided) ---
+  const cachePromise = cachePut(kv, chainId, normalizedAddress, response);
+  if (waitUntil) {
+    waitUntil(cachePromise);
+  } else {
+    await cachePromise;
+  }
+
+  return { status: "success", data: response };
 }

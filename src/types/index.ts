@@ -7,6 +7,7 @@ export interface Env {
   // CDP keys for mainnet facilitator (optional, testnet needs no auth)
   CDP_API_KEY_ID?: string;
   CDP_API_KEY_SECRET?: string;
+  DISABLE_PAYWALL?: string;
 }
 
 // --- GoPlus API types ---
@@ -142,3 +143,40 @@ export interface TokenIntelResponse {
   cached: boolean;
   data_age_seconds: number;
 }
+
+// --- Batch endpoint types ---
+
+export interface BatchTokenRequest {
+  chainId: string;
+  address: string;
+}
+
+export interface BatchRequestBody {
+  tokens: BatchTokenRequest[];
+}
+
+export type BatchItemStatus = "success" | "not_found" | "error";
+
+export interface BatchItemResult {
+  chainId: string;
+  address: string;
+  status: BatchItemStatus;
+  data?: TokenIntelResponse;
+  error?: string;
+}
+
+export interface BatchResponse {
+  results: BatchItemResult[];
+  total: number;
+  succeeded: number;
+  failed: number;
+  partial: boolean;
+}
+
+// --- Shared fetch result for fetchTokenSecurity ---
+
+export type TokenSecurityResult =
+  | { status: "success"; data: TokenIntelResponse }
+  | { status: "not_found" }
+  | { status: "rate_limited" }
+  | { status: "error"; message: string };

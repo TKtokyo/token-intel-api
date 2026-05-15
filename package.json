@@ -13,14 +13,15 @@
     "@x402/evm": "2.4.0",
     "@x402/extensions": "2.4.0",
     "@x402/hono": "2.4.0",
-    "hono": "4.7.6",
-    "viem": "2.23.2"
+    "hono": "^4.12.5",
+    "viem": "2.23.2",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "4.20250214.0",
     "@x402/fetch": "2.4.0",
     "tsx": "^4.21.0",
     "typescript": "5.7.3",
-    "wrangler": "3.109.2"
+    "wrangler": "^3.114.17"
   }
 }
