@@ -125,7 +125,7 @@ Per-item `status` is one of `success`, `not_found`, `error`. Top-level status co
 
 ### `GET /health`
 
-Returns `{ "status": "ok", "version": "0.1.0" }`. No payment required.
+Returns `{ "status": "ok", "version": "0.2.0" }`. No payment required.
 
 ### `GET /.well-known/x402` / `GET /openapi.json` / `GET /llms.txt`
 

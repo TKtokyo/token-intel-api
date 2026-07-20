@@ -31,10 +31,12 @@ interface JsonRpcResponse {
 
 // ─── MCP protocol constants ──────────────────────────────────────
 
+import { VERSION } from "../version.js";
+
 const PROTOCOL_VERSION = "2025-03-26";
 const SERVER_INFO = {
   name: "Token Intelligence API",
-  version: "0.1.0",
+  version: VERSION,
 };
 
 // ─── Tool definitions ───────────────────────────────────────────

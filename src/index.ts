@@ -14,6 +14,7 @@ import { tokenRoutes } from "./routes/token.js";
 import { tokensRoutes } from "./routes/tokens.js";
 import { handleMcpRequest } from "./mcp/server.js";
 import { OPENAPI_SPEC } from "./openapi.js";
+import { VERSION } from "./version.js";
 
 // ─── Token route definitions (single source of truth) ──────────────────────
 //
@@ -46,7 +47,9 @@ const BASE_USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const TOKEN_ROUTES: Record<string, TokenRouteDef> = {
   "/api/v1/token/{chainId}/{address}": {
     method: "GET",
-    middlewarePattern: "GET /api/v1/token/*/*",
+    // Named params (not wildcards) so bazaar discovery emits
+    // routeTemplate /api/v1/token/:chainId/:address with real param names.
+    middlewarePattern: "GET /api/v1/token/:chainId/:address",
     resourcePath: `/api/v1/token/1/${PEPE_ADDRESS}`,
     price: "$0.005",
     resourceName: "EVM Token Intelligence Report",
@@ -281,7 +284,33 @@ function buildAccepts(price: string, env: Env): PaymentRequirement[] {
 }
 
 // Bumped when the route schema, pricing, or sample addresses change.
-const RESOURCES_LAST_UPDATED = "2026-05-15T00:00:00Z";
+const RESOURCES_LAST_UPDATED = "2026-07-21T00:00:00Z";
+
+// Bazaar discovery extension payload per route, shared verbatim between the
+// payment middleware config and the .well-known/x402 manifest so both
+// surfaces always describe the same schemas.
+function buildDiscoveryExtension(route: TokenRouteDef) {
+  return declareDiscoveryExtension(
+    route.bodyType
+      ? {
+          input: route.inputExample,
+          inputSchema: route.inputSchema,
+          bodyType: route.bodyType,
+          output: {
+            example: route.outputExample,
+            schema: route.outputSchema,
+          },
+        }
+      : {
+          input: route.inputExample,
+          inputSchema: route.inputSchema,
+          output: {
+            example: route.outputExample,
+            schema: route.outputSchema,
+          },
+        },
+  );
+}
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -303,13 +332,13 @@ app.onError((err, c) => {
 });
 
 // Health check (unprotected)
-app.get("/health", (c) => c.json({ status: "ok", version: "0.1.0" }));
+app.get("/health", (c) => c.json({ status: "ok", version: VERSION }));
 
 // API info
 app.get("/", (c) =>
   c.json({
     name: "Token Intelligence API",
-    version: "0.1.0",
+    version: VERSION,
     description: "EVM token security analysis via x402 micropayments",
     endpoints: {
       single: "GET /api/v1/token/{chainId}/{address}",
@@ -372,6 +401,11 @@ app.get("/.well-known/x402", (c) => {
     x402Version: 2,
     accepts: buildAccepts(route.price, c.env),
     lastUpdated: RESOURCES_LAST_UPDATED,
+    description: route.description,
+    mimeType: "application/json",
+    // Same bazaar payload the payment middleware declares, so indexers see
+    // identical schemas whether they read the manifest or the 402 response.
+    extensions: buildDiscoveryExtension(route),
     metadata: {
       method: route.method,
       name: route.resourceName,
@@ -383,7 +417,7 @@ app.get("/.well-known/x402", (c) => {
 
   return c.json(
     {
-      x402Version: 1,
+      x402Version: 2,
       resourceServer: baseUrl,
       facilitator: c.env.FACILITATOR_URL,
       network: c.env.X402_NETWORK,
@@ -400,22 +434,36 @@ app.all("/mcp", async (c) => {
   return handleMcpRequest(c.req.raw);
 });
 
-// x402 payment middleware — wraps protected routes
-app.use("/api/v1/*", async (c, next) => {
-  // Skip paywall in local dev when DISABLE_PAYWALL is set
-  if (c.env.DISABLE_PAYWALL === "true") {
-    return next();
+// x402 payment middleware — wraps protected routes.
+//
+// The facilitator client, resource server, and route config are pure
+// functions of env vars, so the middleware is built once per isolate and
+// reused across requests (rebuilt only if env values change, e.g. between
+// wrangler dev sessions).
+let cachedMiddleware: ReturnType<typeof paymentMiddleware> | null = null;
+let cachedMiddlewareKey = "";
+
+function getPaymentMiddleware(env: Env): ReturnType<typeof paymentMiddleware> {
+  const key = [
+    env.X402_NETWORK,
+    env.PAY_TO_ADDRESS,
+    env.FACILITATOR_URL,
+    env.CDP_API_KEY_ID ?? "",
+  ].join("|");
+  if (cachedMiddleware && cachedMiddlewareKey === key) {
+    return cachedMiddleware;
   }
+
   // Use CDP facilitator config when keys are available (mainnet),
   // otherwise use simple URL config (testnet)
   let facilitatorConfig: FacilitatorConfig;
-  if (c.env.CDP_API_KEY_ID && c.env.CDP_API_KEY_SECRET) {
+  if (env.CDP_API_KEY_ID && env.CDP_API_KEY_SECRET) {
     facilitatorConfig = createFacilitatorConfig(
-      c.env.CDP_API_KEY_ID,
-      c.env.CDP_API_KEY_SECRET,
+      env.CDP_API_KEY_ID,
+      env.CDP_API_KEY_SECRET,
     );
   } else {
-    facilitatorConfig = { url: c.env.FACILITATOR_URL };
+    facilitatorConfig = { url: env.FACILITATOR_URL };
   }
   const facilitatorClient = new HTTPFacilitatorClient(facilitatorConfig);
 
@@ -423,12 +471,12 @@ app.use("/api/v1/*", async (c, next) => {
   registerExactEvmScheme(server);
   server.registerExtension(bazaarResourceServerExtension);
 
-  const network = c.env.X402_NETWORK as `eip155:${string}`;
-  const payTo = c.env.PAY_TO_ADDRESS as `0x${string}`;
+  const network = env.X402_NETWORK as `eip155:${string}`;
+  const payTo = env.PAY_TO_ADDRESS as `0x${string}`;
 
   const routes: RoutesConfig = {};
   for (const route of Object.values(TOKEN_ROUTES)) {
-    const accepts = buildAccepts(route.price, c.env);
+    const accepts = buildAccepts(route.price, env);
     routes[route.middlewarePattern] = {
       accepts: {
         scheme: "exact",
@@ -436,47 +484,39 @@ app.use("/api/v1/*", async (c, next) => {
         price: route.price,
         payTo,
       },
-      resource: route.resourceName,
+      // `resource` is intentionally omitted: v2 treats it as the resource
+      // URL and defaults to the request URL. The human-readable name lives
+      // in `serviceName` (Bazaar service metadata).
+      serviceName: "Token Intel API",
       description: route.description,
       mimeType: "application/json",
-      extensions: {
-        ...declareDiscoveryExtension(
-          route.bodyType
-            ? {
-                input: route.inputExample,
-                inputSchema: route.inputSchema,
-                bodyType: route.bodyType,
-                output: {
-                  example: route.outputExample,
-                  schema: route.outputSchema,
-                },
-              }
-            : {
-                input: route.inputExample,
-                inputSchema: route.inputSchema,
-                output: {
-                  example: route.outputExample,
-                  schema: route.outputSchema,
-                },
-              },
-        ),
-      },
+      extensions: buildDiscoveryExtension(route),
       // Mirror accepts[] into the 402 body so callers that only read JSON
       // (e.g. x402scan validators, naive curl checks) see the same payment
       // requirements they would otherwise pull from PAYMENT-REQUIRED header.
       unpaidResponseBody: () => ({
         contentType: "application/json",
         body: {
-          x402Version: 1,
+          x402Version: 2,
           accepts,
-          error: "X-PAYMENT header is required",
+          error:
+            "Payment required: send an x402 payment via the PAYMENT-SIGNATURE header (requirements in the PAYMENT-REQUIRED header and accepts[] above).",
         },
       }),
     };
   }
 
-  const middleware = paymentMiddleware(routes, server);
-  return middleware(c, next);
+  cachedMiddleware = paymentMiddleware(routes, server);
+  cachedMiddlewareKey = key;
+  return cachedMiddleware;
+}
+
+app.use("/api/v1/*", async (c, next) => {
+  // Skip paywall in local dev when DISABLE_PAYWALL is set
+  if (c.env.DISABLE_PAYWALL === "true") {
+    return next();
+  }
+  return getPaymentMiddleware(c.env)(c, next);
 });
 
 // Protected routes

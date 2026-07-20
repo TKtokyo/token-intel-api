@@ -1,6 +1,6 @@
 name = "token-intel-api"
 main = "src/index.ts"
-compatibility_date = "2025-02-25"
+compatibility_date = "2026-07-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Default environment: Base Sepolia (testnet)
