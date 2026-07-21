@@ -288,8 +288,11 @@ function toolCallPrice(tool: McpToolDef, args: Record<string, unknown>): string 
   if (tool.name !== "analyze_tokens_batch") {
     return tool.price;
   }
+  // Malformed args quote 1 token (matching the HTTP route) so auto-paying
+  // clients don't sign the cap price for a call that can never succeed —
+  // validation rejects it after the payment check and the payment cancels.
   const tokens = args.tokens;
-  return batchPrice(Array.isArray(tokens) ? tokens.length : 10);
+  return batchPrice(Array.isArray(tokens) ? tokens.length : 1);
 }
 
 function buildToolCallbacks(

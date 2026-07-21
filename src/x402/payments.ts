@@ -115,6 +115,10 @@ export function envCacheKey(env: Env): string {
     env.PAY_TO_ADDRESS,
     env.FACILITATOR_URL,
     env.CDP_API_KEY_ID ?? "",
+    // Secret included so a rotation with an unchanged key ID doesn't leave
+    // long-lived isolates holding a stale facilitator client (auth failures).
+    // The key stays in isolate memory only and is never logged.
+    env.CDP_API_KEY_SECRET ?? "",
     env.PUBLIC_ORIGIN ?? "",
     env.SIWX_SESSION_TTL_SECONDS ?? "",
   ].join("|");
