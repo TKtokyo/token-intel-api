@@ -1,8 +1,7 @@
 import { Hono } from "hono";
 import type { Env } from "../types/index.js";
 import { fetchTokenSecurity } from "../services/goplus.js";
-
-const ALLOWED_CHAINS = ["1", "8453"];
+import { ALLOWED_CHAINS, ADDRESS_PATTERN } from "../services/batch.js";
 
 const tokenRoutes = new Hono<{ Bindings: Env }>();
 
@@ -23,7 +22,7 @@ tokenRoutes.get("/:chainId/:address", async (c) => {
   }
 
   // Input validation: address format
-  if (!/^0x[a-fA-F0-9]{40}$/.test(rawAddress)) {
+  if (!ADDRESS_PATTERN.test(rawAddress)) {
     return c.json(
       { error: "invalid_address", message: "Invalid contract address format." },
       400,

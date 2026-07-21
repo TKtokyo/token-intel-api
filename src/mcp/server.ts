@@ -1,17 +1,47 @@
 /**
- * Lightweight stateless MCP server implementation (discovery-only).
+ * Lightweight stateless MCP server with x402 paid tool execution.
  *
  * Implements the MCP Streamable HTTP transport (JSON-RPC 2.0) directly,
  * without the heavy @modelcontextprotocol/sdk or agents package.
  *
  * Supported methods:
- *   - initialize              → server capabilities & info
+ *   - initialize                → server capabilities & info
  *   - notifications/initialized → acknowledge (no response)
- *   - tools/list              → available tool definitions (free)
- *   - tools/call              → returns payment-required redirect (no data)
+ *   - tools/list                → available tool definitions (free)
+ *   - tools/call                → paid execution via @x402/mcp payment wrapper
  *
- * Actual data retrieval requires x402 payment via the REST API.
+ * Payment flow (x402 MCP transport):
+ *   1. Client calls a tool without payment → tool result carries a
+ *      PaymentRequired object (isError: true, structuredContent + JSON text).
+ *   2. Client signs payment and retries with the payload in
+ *      params._meta["x402/payment"].
+ *   3. Server verifies via facilitator, runs the tool, settles, and attaches
+ *      the settlement receipt to result._meta["x402/payment-response"].
+ *
+ * x402-aware clients (@x402/mcp x402MCPClient) handle this automatically.
  */
+
+import { createPaymentWrapper } from "@x402/mcp";
+import type { MCPToolCallback, WrappedToolResult, ToolResult } from "@x402/mcp";
+import { declareDiscoveryExtension } from "@x402/extensions/bazaar";
+import type { Env } from "../types/index.js";
+import { fetchTokenSecurity } from "../services/goplus.js";
+import {
+  validateBatchTokens,
+  runBatch,
+  ALLOWED_CHAINS,
+  ADDRESS_PATTERN,
+} from "../services/batch.js";
+import {
+  getResourceServer,
+  buildAccepts,
+  batchPrice,
+  SERVICE_NAME,
+  SERVICE_TAGS,
+  PRICE_SINGLE,
+  PRICE_BATCH,
+} from "../x402/payments.js";
+import { VERSION } from "../version.js";
 
 // ─── JSON-RPC types ──────────────────────────────────────────────
 
@@ -31,26 +61,35 @@ interface JsonRpcResponse {
 
 // ─── MCP protocol constants ──────────────────────────────────────
 
-const PROTOCOL_VERSION = "2025-03-26";
+const PROTOCOL_VERSION = "2025-06-18";
 const SERVER_INFO = {
-  name: "Token Intelligence API",
-  version: "0.1.0",
+  name: SERVICE_NAME,
+  version: VERSION,
 };
 
 // ─── Tool definitions ───────────────────────────────────────────
 
-const TOOLS = [
+export interface McpToolDef {
+  name: string;
+  description: string;
+  price: string;
+  inputSchema: Record<string, unknown>;
+  outputExample: unknown;
+}
+
+export const MCP_TOOLS: McpToolDef[] = [
   {
     name: "analyze_token",
     description:
-      "EVM token security analysis with risk scoring. Returns security flags, holder info, liquidity data, risk score (0-100), and a human-readable summary. Requires x402 payment ($0.005 USDC) via REST API.",
+      `EVM token security analysis with risk scoring. Returns security flags, holder info, liquidity data, risk score (0-100), and a human-readable summary. Paid tool: ${PRICE_SINGLE} USDC per call via x402 (payment handled in-protocol; x402-aware MCP clients pay automatically).`,
+    price: PRICE_SINGLE,
     inputSchema: {
       type: "object" as const,
       properties: {
         chainId: {
           type: "string",
           description: "Chain ID: '1' for Ethereum, '8453' for Base",
-          enum: ["1", "8453"],
+          enum: ALLOWED_CHAINS,
         },
         address: {
           type: "string",
@@ -61,11 +100,18 @@ const TOOLS = [
       },
       required: ["chainId", "address"],
     },
+    outputExample: {
+      token: { name: "Pepe", symbol: "PEPE", chain_id: "1" },
+      risk_score: 85,
+      risk_level: "LOW",
+      summary: "LOW risk. Contract is open source, verified.",
+    },
   },
   {
     name: "analyze_tokens_batch",
     description:
-      "Batch security analysis for up to 10 EVM tokens in one request. Returns per-token results with security flags, risk scores, and summaries. Requires x402 payment ($0.02 USDC) via REST API.",
+      `Batch security analysis for up to 10 EVM tokens in one request. Returns per-token results with security flags, risk scores, and summaries. Paid tool: $0.003 USDC per token, capped at ${PRICE_BATCH}, via x402 (payment handled in-protocol; x402-aware MCP clients pay automatically).`,
+    price: PRICE_BATCH,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -78,7 +124,7 @@ const TOOLS = [
               chainId: {
                 type: "string",
                 description: "Chain ID: '1' for Ethereum, '8453' for Base",
-                enum: ["1", "8453"],
+                enum: ALLOWED_CHAINS,
               },
               address: {
                 type: "string",
@@ -95,14 +141,209 @@ const TOOLS = [
       },
       required: ["tokens"],
     },
+    outputExample: {
+      results: [
+        {
+          chainId: "1",
+          address: "0x...",
+          status: "success",
+          data: { risk_score: 85, risk_level: "LOW" },
+        },
+      ],
+      total: 1,
+      succeeded: 1,
+      failed: 0,
+      partial: false,
+    },
   },
 ];
 
+/**
+ * Bazaar discovery extension payload for an MCP tool. Used both in the
+ * PaymentRequired responses emitted by the payment wrapper and in the
+ * .well-known/x402 manifest, so indexers see identical metadata.
+ */
+export function buildMcpDiscoveryExtension(
+  tool: McpToolDef,
+): Record<string, unknown> {
+  return declareDiscoveryExtension({
+    toolName: tool.name,
+    description: tool.description,
+    transport: "streamable-http",
+    inputSchema: tool.inputSchema,
+    output: { example: tool.outputExample },
+  });
+}
+
+// ─── Tool handlers (business logic, payment-agnostic) ────────────
+
+function textResult(payload: unknown, isError = false): ToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify(payload) }],
+    structuredContent: payload as Record<string, unknown>,
+    isError,
+  };
+}
+
+function makeAnalyzeTokenHandler(
+  env: Env,
+  waitUntil?: (p: Promise<unknown>) => void,
+) {
+  return async (args: Record<string, unknown>): Promise<ToolResult> => {
+    const chainId = String(args.chainId ?? "");
+    const rawAddress = String(args.address ?? "");
+
+    if (!ALLOWED_CHAINS.includes(chainId)) {
+      return textResult(
+        {
+          error: "invalid_chain",
+          message: `Unsupported chain. Allowed: ${ALLOWED_CHAINS.join(", ")}`,
+        },
+        true,
+      );
+    }
+    if (!ADDRESS_PATTERN.test(rawAddress)) {
+      return textResult(
+        {
+          error: "invalid_address",
+          message: "Invalid contract address format.",
+        },
+        true,
+      );
+    }
+
+    const result = await fetchTokenSecurity(
+      chainId,
+      rawAddress.toLowerCase(),
+      env.GOPLUS_API_KEY,
+      env.TOKEN_CACHE,
+      waitUntil,
+    );
+
+    switch (result.status) {
+      case "success":
+        return textResult(result.data);
+      case "not_found":
+        return textResult(
+          {
+            error: "token_not_found",
+            message: "No security data available for this token.",
+          },
+          true,
+        );
+      case "rate_limited":
+        return textResult(
+          {
+            error: "upstream_throttled",
+            message: "Data source rate limited. Please retry in 30 seconds.",
+          },
+          true,
+        );
+      case "error":
+        return textResult(
+          {
+            error: "upstream_unavailable",
+            message: "Security data source temporarily unavailable.",
+          },
+          true,
+        );
+    }
+  };
+}
+
+function makeBatchHandler(
+  env: Env,
+  waitUntil?: (p: Promise<unknown>) => void,
+) {
+  return async (args: Record<string, unknown>): Promise<ToolResult> => {
+    const validationError = validateBatchTokens(args.tokens);
+    if (validationError) {
+      return textResult(validationError, true);
+    }
+    const response = await runBatch(
+      args.tokens as { chainId: string; address: string }[],
+      env,
+      waitUntil,
+    );
+    return textResult(response);
+  };
+}
+
+// ─── Paid tool dispatch ──────────────────────────────────────────
+
+/**
+ * Build the payment-wrapped tool callbacks for this request.
+ *
+ * The resource server is memoized per isolate (getResourceServer); the
+ * wrappers themselves are cheap closures created per request so they can
+ * capture env and waitUntil.
+ */
+/**
+ * Price a tool call. The batch tool uses dynamic pricing ($0.003/token,
+ * capped at $0.020) based on the actual arguments of this call; unparseable
+ * arguments price at the cap and then fail validation (payment cancelled,
+ * not settled).
+ */
+function toolCallPrice(tool: McpToolDef, args: Record<string, unknown>): string {
+  if (tool.name !== "analyze_tokens_batch") {
+    return tool.price;
+  }
+  // Malformed args quote 1 token (matching the HTTP route) so auto-paying
+  // clients don't sign the cap price for a call that can never succeed —
+  // validation rejects it after the payment check and the payment cancels.
+  const tokens = args.tokens;
+  return batchPrice(Array.isArray(tokens) ? tokens.length : 1);
+}
+
+function buildToolCallbacks(
+  env: Env,
+  args: Record<string, unknown>,
+  waitUntil?: (p: Promise<unknown>) => void,
+): Record<string, MCPToolCallback> {
+  const handlers: Record<
+    string,
+    (args: Record<string, unknown>) => Promise<ToolResult>
+  > = {
+    analyze_token: makeAnalyzeTokenHandler(env, waitUntil),
+    analyze_tokens_batch: makeBatchHandler(env, waitUntil),
+  };
+
+  // Local dev: skip payment entirely when DISABLE_PAYWALL is set.
+  if (env.DISABLE_PAYWALL === "true") {
+    const passthrough: Record<string, MCPToolCallback> = {};
+    for (const [name, handler] of Object.entries(handlers)) {
+      passthrough[name] = async (callArgs) =>
+        (await handler(callArgs)) as WrappedToolResult;
+    }
+    return passthrough;
+  }
+
+  const server = getResourceServer(env);
+  const callbacks: Record<string, MCPToolCallback> = {};
+  for (const tool of MCP_TOOLS) {
+    const paid = createPaymentWrapper(server, {
+      accepts: buildAccepts(toolCallPrice(tool, args), env) as never,
+      resource: {
+        url: `mcp://tool/${tool.name}`,
+        description: tool.description,
+        mimeType: "application/json",
+        serviceName: SERVICE_NAME,
+        tags: SERVICE_TAGS,
+      },
+      extensions: buildMcpDiscoveryExtension(tool),
+    });
+    callbacks[tool.name] = paid(handlers[tool.name]);
+  }
+  return callbacks;
+}
+
 // ─── JSON-RPC method dispatcher ──────────────────────────────────
 
-function handleJsonRpcRequest(
+async function handleJsonRpcRequest(
   req: JsonRpcRequest,
-): JsonRpcResponse | null {
+  env: Env,
+  waitUntil?: (p: Promise<unknown>) => void,
+): Promise<JsonRpcResponse | null> {
   const { method, id, params } = req;
 
   // Notifications have no id and expect no response
@@ -128,52 +369,47 @@ function handleJsonRpcRequest(
       return {
         jsonrpc: "2.0",
         id,
-        result: { tools: TOOLS },
+        result: {
+          tools: MCP_TOOLS.map((t) => ({
+            name: t.name,
+            description: t.description,
+            inputSchema: t.inputSchema,
+          })),
+        },
       };
 
     case "tools/call": {
-      const toolName = (params as { name?: string })?.name;
-
-      if (toolName === "analyze_token") {
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: {
-            content: [
-              {
-                type: "text",
-                text: "Payment required. Please use the REST API endpoint with x402 payment: GET /api/v1/token/{chainId}/{address} — $0.005 USDC on Base.",
-              },
-            ],
-            isError: false,
-          },
-        };
-      }
-
-      if (toolName === "analyze_tokens_batch") {
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: {
-            content: [
-              {
-                type: "text",
-                text: "Payment required. Please use the REST API endpoint with x402 payment: POST /api/v1/tokens — $0.02 USDC on Base. Send JSON body: { \"tokens\": [{ \"chainId\": \"1\", \"address\": \"0x...\" }, ...] } (max 10 tokens).",
-              },
-            ],
-            isError: false,
-          },
-        };
-      }
-
-      return {
-        jsonrpc: "2.0",
-        id,
-        error: {
-          code: -32602,
-          message: "Unknown tool.",
-        },
+      const p = (params ?? {}) as {
+        name?: string;
+        arguments?: Record<string, unknown>;
+        _meta?: Record<string, unknown>;
       };
+      const toolName = p.name;
+      if (!toolName || !MCP_TOOLS.some((t) => t.name === toolName)) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32602, message: "Unknown tool." },
+        };
+      }
+
+      const callbacks = buildToolCallbacks(env, p.arguments ?? {}, waitUntil);
+      try {
+        const result = await callbacks[toolName](p.arguments ?? {}, {
+          _meta: p._meta,
+        });
+        return { jsonrpc: "2.0", id, result };
+      } catch (err) {
+        console.error(
+          `MCP tools/call ${toolName} failed:`,
+          err instanceof Error ? err.message : err,
+        );
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32603, message: "Tool execution failed." },
+        };
+      }
     }
 
     default:
@@ -214,10 +450,12 @@ function withCors(response: Response): Response {
 
 /**
  * Handle an MCP Streamable HTTP request.
- * Discovery-only: initialize + tools/list are free, tools/call returns payment redirect.
+ * initialize + tools/list are free; tools/call executes with x402 payment.
  */
 export async function handleMcpRequest(
   request: Request,
+  env: Env,
+  waitUntil?: (p: Promise<unknown>) => void,
 ): Promise<Response> {
   // CORS preflight
   if (request.method === "OPTIONS") {
@@ -300,7 +538,7 @@ export async function handleMcpRequest(
   if (Array.isArray(body)) {
     const responses: JsonRpcResponse[] = [];
     for (const req of body as JsonRpcRequest[]) {
-      const resp = handleJsonRpcRequest(req);
+      const resp = await handleJsonRpcRequest(req, env, waitUntil);
       if (resp) responses.push(resp);
     }
     if (responses.length === 0) {
@@ -314,7 +552,11 @@ export async function handleMcpRequest(
   }
 
   // Single request
-  const resp = handleJsonRpcRequest(body as JsonRpcRequest);
+  const resp = await handleJsonRpcRequest(
+    body as JsonRpcRequest,
+    env,
+    waitUntil,
+  );
   if (!resp) {
     return withCors(new Response(null, { status: 204 }));
   }
