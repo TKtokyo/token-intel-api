@@ -127,9 +127,40 @@ Per-item `status` is one of `success`, `not_found`, `error`. Top-level status co
 
 Returns `{ "status": "ok", "version": "0.2.0" }`. No payment required.
 
+### MCP: `POST /mcp` (streamable HTTP)
+
+The MCP server executes tools with **in-protocol x402 payment** — agents pay inside the MCP flow, no REST detour needed.
+
+| Tool | Price | Description |
+|---|---|---|
+| `analyze_token` | $0.005 USDC | Single-token analysis (same output as `GET /api/v1/token`) |
+| `analyze_tokens_batch` | $0.020 USDC | Batch analysis, up to 10 tokens |
+
+Payment flow (x402 MCP transport, handled automatically by `@x402/mcp` clients):
+
+1. `tools/call` without payment → result carries a `PaymentRequired` object (`isError: true`, JSON in `content[0].text` + `structuredContent`)
+2. Client signs USDC payment, retries with the payload in `params._meta["x402/payment"]`
+3. Server verifies via facilitator, executes the tool, settles, and returns the receipt in `result._meta["x402/payment-response"]`
+
+```typescript
+import { createx402MCPClient } from "@x402/mcp";
+import { ExactEvmScheme } from "@x402/evm/exact/client";
+
+const client = createx402MCPClient({
+  name: "my-agent",
+  version: "1.0.0",
+  schemes: [{ network: "eip155:8453", client: new ExactEvmScheme(account) }],
+  autoPayment: true,
+});
+// connect via StreamableHTTPClientTransport to https://token-intel-api.tatsu77.workers.dev/mcp
+const result = await client.callTool("analyze_token", { chainId: "1", address: "0x…" });
+```
+
+`initialize` and `tools/list` are free. Failed tool runs (invalid input, upstream errors) are not charged — payment is cancelled instead of settled.
+
 ### `GET /.well-known/x402` / `GET /openapi.json` / `GET /llms.txt`
 
-Free discovery endpoints. The x402 manifest emits the standard `resources[]` array (DiscoveryResource schema) so x402scan and other bazaar consumers can register both paid endpoints.
+Free discovery endpoints. The x402 manifest emits the standard `resources[]` array (DiscoveryResource schema) covering all four paid resources — both REST endpoints (`type: "http"`) and both MCP tools (`type: "mcp"`) — with `serviceName`, `tags`, and the same bazaar extension payloads the payment layer emits, so x402scan and other bazaar consumers index identical metadata.
 
 ## Risk Scoring
 

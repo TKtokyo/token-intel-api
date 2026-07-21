@@ -1,20 +1,26 @@
 import { Hono } from "hono";
-import { paymentMiddleware, x402ResourceServer } from "@x402/hono";
-import { HTTPFacilitatorClient } from "@x402/core/server";
-import { registerExactEvmScheme } from "@x402/evm/exact/server";
-import {
-  declareDiscoveryExtension,
-  bazaarResourceServerExtension,
-} from "@x402/extensions/bazaar";
-import { createFacilitatorConfig } from "@coinbase/x402";
+import { paymentMiddleware } from "@x402/hono";
+import { declareDiscoveryExtension } from "@x402/extensions/bazaar";
 import type { RoutesConfig } from "@x402/core/server";
-import type { FacilitatorConfig } from "@x402/core/http";
 import type { Env } from "./types/index.js";
 import { tokenRoutes } from "./routes/token.js";
 import { tokensRoutes } from "./routes/tokens.js";
-import { handleMcpRequest } from "./mcp/server.js";
+import {
+  handleMcpRequest,
+  MCP_TOOLS,
+  buildMcpDiscoveryExtension,
+} from "./mcp/server.js";
 import { OPENAPI_SPEC } from "./openapi.js";
 import { VERSION } from "./version.js";
+import {
+  buildAccepts,
+  getResourceServer,
+  envCacheKey,
+  SERVICE_NAME,
+  SERVICE_TAGS,
+  PRICE_SINGLE,
+  PRICE_BATCH,
+} from "./x402/payments.js";
 
 // ─── Token route definitions (single source of truth) ──────────────────────
 //
@@ -51,7 +57,7 @@ const TOKEN_ROUTES: Record<string, TokenRouteDef> = {
     // routeTemplate /api/v1/token/:chainId/:address with real param names.
     middlewarePattern: "GET /api/v1/token/:chainId/:address",
     resourcePath: `/api/v1/token/1/${PEPE_ADDRESS}`,
-    price: "$0.005",
+    price: PRICE_SINGLE,
     resourceName: "EVM Token Intelligence Report",
     description:
       "Security analysis, deterministic risk score, and natural language summary for any EVM token",
@@ -128,7 +134,7 @@ const TOKEN_ROUTES: Record<string, TokenRouteDef> = {
     method: "POST",
     middlewarePattern: "POST /api/v1/tokens",
     resourcePath: "/api/v1/tokens",
-    price: "$0.020",
+    price: PRICE_BATCH,
     bodyType: "json",
     resourceName: "Batch EVM Token Intelligence Report",
     description:
@@ -224,65 +230,6 @@ const TOKEN_ROUTES: Record<string, TokenRouteDef> = {
   },
 };
 
-interface UsdcInfo {
-  address: string;
-  name: string;
-  version: string;
-}
-
-// USDC contract metadata per supported network. Values must match what
-// @x402/hono resolves on-chain, so the manifest's accepts[] is byte-identical
-// to the middleware-emitted PAYMENT-REQUIRED payload.
-const USDC_BY_NETWORK: Record<string, UsdcInfo> = {
-  "eip155:8453": {
-    address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-    name: "USD Coin",
-    version: "2",
-  },
-  "eip155:84532": {
-    address: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
-    name: "USDC",
-    version: "2",
-  },
-};
-
-// "$0.020" -> "20000" (USDC has 6 decimals). BigInt-based so no float drift.
-function usdToUsdcBaseUnits(price: string): string {
-  const match = /^\$(\d+)(?:\.(\d{1,6}))?$/.exec(price);
-  if (!match) throw new Error(`Invalid price format: ${price}`);
-  const whole = BigInt(match[1]);
-  const frac = (match[2] ?? "").padEnd(6, "0");
-  return (whole * 1_000_000n + BigInt(frac || "0")).toString();
-}
-
-interface PaymentRequirement {
-  scheme: "exact";
-  network: string;
-  amount: string;
-  asset: string;
-  payTo: string;
-  maxTimeoutSeconds: number;
-  extra: { name: string; version: string };
-}
-
-function buildAccepts(price: string, env: Env): PaymentRequirement[] {
-  const usdc = USDC_BY_NETWORK[env.X402_NETWORK];
-  if (!usdc) {
-    throw new Error(`Unsupported X402_NETWORK: ${env.X402_NETWORK}`);
-  }
-  return [
-    {
-      scheme: "exact",
-      network: env.X402_NETWORK,
-      amount: usdToUsdcBaseUnits(price),
-      asset: usdc.address,
-      payTo: env.PAY_TO_ADDRESS,
-      maxTimeoutSeconds: 300,
-      extra: { name: usdc.name, version: usdc.version },
-    },
-  ];
-}
-
 // Bumped when the route schema, pricing, or sample addresses change.
 const RESOURCES_LAST_UPDATED = "2026-07-21T00:00:00Z";
 
@@ -344,13 +291,14 @@ app.get("/", (c) =>
       single: "GET /api/v1/token/{chainId}/{address}",
       batch: "POST /api/v1/tokens",
     },
-    price: { single: "$0.005", batch: "$0.020" },
+    price: { single: PRICE_SINGLE, batch: PRICE_BATCH },
     example: "/api/v1/token/1/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     x402: true,
     mcp: {
       endpoint: "/mcp",
       transport: "streamable-http",
-      tools: ["analyze_token"],
+      tools: MCP_TOOLS.map((t) => t.name),
+      payment: "x402 in-protocol (params._meta['x402/payment'])",
     },
   }),
 );
@@ -382,6 +330,7 @@ Both paid endpoints run on Base mainnet. chainId is "1" (Ethereum) or "8453" (Ba
 
 ## MCP
 - Streamable HTTP: https://token-intel-api.tatsu77.workers.dev/mcp
+- Paid tools with in-protocol x402 payment: analyze_token ($0.005), analyze_tokens_batch ($0.020). x402-aware MCP clients (@x402/mcp) pay automatically via params._meta["x402/payment"].
 `;
   return c.text(body, 200, {
     "Content-Type": "text/plain; charset=utf-8",
@@ -395,7 +344,7 @@ Both paid endpoints run on Base mainnet. chainId is "1" (Ethereum) or "8453" (Ba
 // so the manifest and the 402 response stay byte-identical.
 app.get("/.well-known/x402", (c) => {
   const baseUrl = new URL(c.req.url).origin;
-  const resources = Object.values(TOKEN_ROUTES).map((route) => ({
+  const httpResources = Object.values(TOKEN_ROUTES).map((route) => ({
     resource: `${baseUrl}${route.resourcePath}`,
     type: "http",
     x402Version: 2,
@@ -403,6 +352,8 @@ app.get("/.well-known/x402", (c) => {
     lastUpdated: RESOURCES_LAST_UPDATED,
     description: route.description,
     mimeType: "application/json",
+    serviceName: SERVICE_NAME,
+    tags: SERVICE_TAGS,
     // Same bazaar payload the payment middleware declares, so indexers see
     // identical schemas whether they read the manifest or the 402 response.
     extensions: buildDiscoveryExtension(route),
@@ -414,6 +365,29 @@ app.get("/.well-known/x402", (c) => {
       outputExample: route.outputExample,
     },
   }));
+
+  // MCP tools are paid resources too: same accepts[], same bazaar payload the
+  // MCP payment wrapper emits in its PaymentRequired responses.
+  const mcpResources = MCP_TOOLS.map((tool) => ({
+    resource: `mcp://tool/${tool.name}`,
+    type: "mcp",
+    x402Version: 2,
+    accepts: buildAccepts(tool.price, c.env),
+    lastUpdated: RESOURCES_LAST_UPDATED,
+    description: tool.description,
+    mimeType: "application/json",
+    serviceName: SERVICE_NAME,
+    tags: SERVICE_TAGS,
+    extensions: buildMcpDiscoveryExtension(tool),
+    metadata: {
+      transport: "streamable-http",
+      endpoint: `${baseUrl}/mcp`,
+      toolName: tool.name,
+      inputSchema: tool.inputSchema,
+    },
+  }));
+
+  const resources = [...httpResources, ...mcpResources];
 
   return c.json(
     {
@@ -431,7 +405,9 @@ app.get("/.well-known/x402", (c) => {
 
 // MCP server endpoint (discovery-only — no data, no upstream calls)
 app.all("/mcp", async (c) => {
-  return handleMcpRequest(c.req.raw);
+  return handleMcpRequest(c.req.raw, c.env, (p) =>
+    c.executionCtx.waitUntil(p),
+  );
 });
 
 // x402 payment middleware — wraps protected routes.
@@ -444,32 +420,12 @@ let cachedMiddleware: ReturnType<typeof paymentMiddleware> | null = null;
 let cachedMiddlewareKey = "";
 
 function getPaymentMiddleware(env: Env): ReturnType<typeof paymentMiddleware> {
-  const key = [
-    env.X402_NETWORK,
-    env.PAY_TO_ADDRESS,
-    env.FACILITATOR_URL,
-    env.CDP_API_KEY_ID ?? "",
-  ].join("|");
+  const key = envCacheKey(env);
   if (cachedMiddleware && cachedMiddlewareKey === key) {
     return cachedMiddleware;
   }
 
-  // Use CDP facilitator config when keys are available (mainnet),
-  // otherwise use simple URL config (testnet)
-  let facilitatorConfig: FacilitatorConfig;
-  if (env.CDP_API_KEY_ID && env.CDP_API_KEY_SECRET) {
-    facilitatorConfig = createFacilitatorConfig(
-      env.CDP_API_KEY_ID,
-      env.CDP_API_KEY_SECRET,
-    );
-  } else {
-    facilitatorConfig = { url: env.FACILITATOR_URL };
-  }
-  const facilitatorClient = new HTTPFacilitatorClient(facilitatorConfig);
-
-  const server = new x402ResourceServer(facilitatorClient);
-  registerExactEvmScheme(server);
-  server.registerExtension(bazaarResourceServerExtension);
+  const server = getResourceServer(env);
 
   const network = env.X402_NETWORK as `eip155:${string}`;
   const payTo = env.PAY_TO_ADDRESS as `0x${string}`;
@@ -487,7 +443,8 @@ function getPaymentMiddleware(env: Env): ReturnType<typeof paymentMiddleware> {
       // `resource` is intentionally omitted: v2 treats it as the resource
       // URL and defaults to the request URL. The human-readable name lives
       // in `serviceName` (Bazaar service metadata).
-      serviceName: "Token Intel API",
+      serviceName: SERVICE_NAME,
+      tags: SERVICE_TAGS,
       description: route.description,
       mimeType: "application/json",
       extensions: buildDiscoveryExtension(route),
