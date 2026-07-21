@@ -8,6 +8,12 @@ export interface Env {
   CDP_API_KEY_ID?: string;
   CDP_API_KEY_SECRET?: string;
   DISABLE_PAYWALL?: string;
+  // Public browser-visible origin, used for SIWx domain/URI binding.
+  // Falls back to http://localhost:8787 for local dev.
+  PUBLIC_ORIGIN?: string;
+  // SIWx session length in seconds (default 3600): how long a wallet that
+  // paid for a resource can re-read it without paying again.
+  SIWX_SESSION_TTL_SECONDS?: string;
 }
 
 // --- GoPlus API types ---

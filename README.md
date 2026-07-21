@@ -21,6 +21,8 @@ One HTTP request, one microtransaction ($0.005 USDC), one structured response.
 
 **Payment:** $0.005 USDC via x402 protocol on Base mainnet
 
+**SIWx sessions:** a wallet that paid for a token analysis can re-read the *same* resource free for 1 hour (configurable via `SIWX_SESSION_TTL_SECONDS`). The 402 response carries a `sign-in-with-x` challenge (CAIP-122); sign it and send the proof in the `SIGN-IN-WITH-X` header — `@x402/extensions/sign-in-with-x` clients (`createSIWxClientExtension`) do this automatically. Nonces are single-use (KV-tracked) to prevent replay.
+
 **Path parameters:**
 | Parameter | Description |
 |---|---|
@@ -85,7 +87,7 @@ One HTTP request, one microtransaction ($0.005 USDC), one structured response.
 
 Batch analysis of up to 10 EVM tokens in a single request.
 
-**Payment:** $0.020 USDC via x402 protocol on Base mainnet
+**Payment:** dynamic — $0.003 USDC per token, capped at $0.020 (x402 v2 dynamic pricing; the 402 response always quotes the exact price for your token count)
 
 **Request body:**
 
@@ -134,7 +136,7 @@ The MCP server executes tools with **in-protocol x402 payment** — agents pay i
 | Tool | Price | Description |
 |---|---|---|
 | `analyze_token` | $0.005 USDC | Single-token analysis (same output as `GET /api/v1/token`) |
-| `analyze_tokens_batch` | $0.020 USDC | Batch analysis, up to 10 tokens |
+| `analyze_tokens_batch` | $0.003/token, cap $0.020 | Batch analysis, up to 10 tokens (dynamic pricing) |
 
 Payment flow (x402 MCP transport, handled automatically by `@x402/mcp` clients):
 
@@ -231,6 +233,8 @@ npx wrangler deploy --env production
 | `GOPLUS_API_KEY` | Wrangler secret | GoPlus API key |
 | `CDP_API_KEY_ID` | Wrangler secret (production) | Coinbase Developer Platform key ID |
 | `CDP_API_KEY_SECRET` | Wrangler secret (production) | CDP key secret |
+| `PUBLIC_ORIGIN` | wrangler.toml vars | Public origin for SIWx domain/URI binding (localhost in `.dev.vars` for dev) |
+| `SIWX_SESSION_TTL_SECONDS` | wrangler.toml vars (optional) | SIWx re-read window per paid resource, default 3600 |
 
 ## Architecture
 

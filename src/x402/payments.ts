@@ -2,9 +2,11 @@ import { x402ResourceServer } from "@x402/core/server";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { registerExactEvmScheme } from "@x402/evm/exact/server";
 import { bazaarResourceServerExtension } from "@x402/extensions/bazaar";
+import { createSIWxResourceServerExtension } from "@x402/extensions/sign-in-with-x";
 import { createFacilitatorConfig } from "@coinbase/x402";
 import type { FacilitatorConfig } from "@x402/core/http";
 import type { Env } from "../types/index.js";
+import { KVSIWxStorage } from "./siwx.js";
 
 // ─── Service-level Bazaar metadata (shared by HTTP routes and MCP tools) ───
 
@@ -14,7 +16,29 @@ export const SERVICE_TAGS = ["defi", "security", "token", "risk", "evm"];
 // ─── Pricing (single source of truth for REST routes and MCP tools) ────────
 
 export const PRICE_SINGLE = "$0.005";
+/** Batch: per-token price, capped so no batch ever costs more than before. */
+export const BATCH_UNITS_PER_TOKEN = 3_000n; // $0.003 in USDC base units
+export const BATCH_UNITS_CAP = 20_000n; // $0.020 cap
+/** Advertised maximum batch price (manifest, docs). */
 export const PRICE_BATCH = "$0.020";
+
+/** USDC base units (6 decimals) → "$0.009"-style dollar string. */
+export function formatUsd(units: bigint): string {
+  const whole = units / 1_000_000n;
+  const frac = (units % 1_000_000n).toString().padStart(6, "0").replace(/0+$/, "");
+  return frac.length > 0 ? `$${whole}.${frac}` : `$${whole}`;
+}
+
+/** Price for a batch of `count` tokens: $0.003/token, capped at $0.020. */
+export function batchPriceUnits(count: number): bigint {
+  const n = BigInt(Math.max(1, Math.min(10, Math.floor(count))));
+  const units = BATCH_UNITS_PER_TOKEN * n;
+  return units > BATCH_UNITS_CAP ? BATCH_UNITS_CAP : units;
+}
+
+export function batchPrice(count: number): string {
+  return formatUsd(batchPriceUnits(count));
+}
 
 // ─── USDC payment requirements ─────────────────────────────────────────────
 
@@ -91,7 +115,15 @@ export function envCacheKey(env: Env): string {
     env.PAY_TO_ADDRESS,
     env.FACILITATOR_URL,
     env.CDP_API_KEY_ID ?? "",
+    env.PUBLIC_ORIGIN ?? "",
+    env.SIWX_SESSION_TTL_SECONDS ?? "",
   ].join("|");
+}
+
+/** SIWx session length: how long a paid wallet can re-read the same resource. */
+export function siwxSessionTtlSeconds(env: Env): number {
+  const parsed = parseInt(env.SIWX_SESSION_TTL_SECONDS ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 3600;
 }
 
 export function getResourceServer(env: Env): x402ResourceServer {
@@ -116,6 +148,16 @@ export function getResourceServer(env: Env): x402ResourceServer {
   const server = new x402ResourceServer(facilitatorClient);
   registerExactEvmScheme(server);
   server.registerExtension(bazaarResourceServerExtension);
+
+  // SIWx sessions: a settled payment lets the same wallet re-read the same
+  // resource without paying again (KV-backed, TTL-bound). Only routes that
+  // declare the sign-in-with-x extension participate.
+  server.registerExtension(
+    createSIWxResourceServerExtension({
+      storage: new KVSIWxStorage(env.TOKEN_CACHE, siwxSessionTtlSeconds(env)),
+      origin: env.PUBLIC_ORIGIN ?? "http://localhost:8787",
+    }),
+  );
 
   cachedServer = server;
   cachedServerKey = key;

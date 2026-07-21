@@ -14,6 +14,7 @@ import { OPENAPI_SPEC } from "./openapi.js";
 import { VERSION } from "./version.js";
 import {
   buildAccepts,
+  batchPrice,
   getResourceServer,
   envCacheKey,
   SERVICE_NAME,
@@ -21,6 +22,7 @@ import {
   PRICE_SINGLE,
   PRICE_BATCH,
 } from "./x402/payments.js";
+import { declareSIWxExtension } from "@x402/extensions/sign-in-with-x";
 
 // ─── Token route definitions (single source of truth) ──────────────────────
 //
@@ -138,7 +140,7 @@ const TOKEN_ROUTES: Record<string, TokenRouteDef> = {
     bodyType: "json",
     resourceName: "Batch EVM Token Intelligence Report",
     description:
-      "Batch security analysis for up to 10 EVM tokens in a single request",
+      "Batch security analysis for up to 10 EVM tokens in a single request ($0.003 per token, capped at $0.020)",
     inputExample: {
       tokens: [
         { chainId: "1", address: PEPE_ADDRESS },
@@ -291,7 +293,11 @@ app.get("/", (c) =>
       single: "GET /api/v1/token/{chainId}/{address}",
       batch: "POST /api/v1/tokens",
     },
-    price: { single: PRICE_SINGLE, batch: PRICE_BATCH },
+    price: {
+      single: PRICE_SINGLE,
+      batch: `$0.003/token, capped at ${PRICE_BATCH}`,
+    },
+    siwx: "Paid wallets can re-read the same single-token resource free for 1h (SIGN-IN-WITH-X header)",
     example: "/api/v1/token/1/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     x402: true,
     mcp: {
@@ -317,8 +323,8 @@ app.get("/llms.txt", (c) => {
 > EVM token security analysis with deterministic risk scoring and natural language summaries via x402 micropayments.
 
 ## Endpoints
-- GET /api/v1/token/{chainId}/{address} — Analyze a single EVM token ($0.005 USDC, x402)
-- POST /api/v1/tokens — Batch-analyze up to 10 EVM tokens in one request ($0.020 USDC, x402)
+- GET /api/v1/token/{chainId}/{address} — Analyze a single EVM token ($0.005 USDC, x402). Wallets that paid can re-read the same resource free for 1 hour via SIGN-IN-WITH-X.
+- POST /api/v1/tokens — Batch-analyze up to 10 EVM tokens in one request ($0.003 USDC per token, capped at $0.020, x402)
 
 Both paid endpoints run on Base mainnet. chainId is "1" (Ethereum) or "8453" (Base); address is the ERC-20 contract.
 
@@ -430,14 +436,45 @@ function getPaymentMiddleware(env: Env): ReturnType<typeof paymentMiddleware> {
   const network = env.X402_NETWORK as `eip155:${string}`;
   const payTo = env.PAY_TO_ADDRESS as `0x${string}`;
 
+  // Count tokens in a (possibly invalid) batch body; invalid bodies price at
+  // 1 token — validation then rejects them with 400 after the payment check,
+  // which cancels the payment instead of settling it.
+  const batchTokenCount = async (ctx: {
+    adapter: { getBody?: () => unknown };
+  }): Promise<number> => {
+    try {
+      const body = (await ctx.adapter.getBody?.()) as
+        | { tokens?: unknown[] }
+        | undefined;
+      return Array.isArray(body?.tokens) ? body.tokens.length : 1;
+    } catch {
+      return 1;
+    }
+  };
+
+  const unpaidBody = (accepts: unknown) => ({
+    contentType: "application/json",
+    body: {
+      x402Version: 2,
+      accepts,
+      error:
+        "Payment required: send an x402 payment via the PAYMENT-SIGNATURE header (requirements in the PAYMENT-REQUIRED header and accepts[] above).",
+    },
+  });
+
   const routes: RoutesConfig = {};
   for (const route of Object.values(TOKEN_ROUTES)) {
-    const accepts = buildAccepts(route.price, env);
+    const isBatch = route.method === "POST";
     routes[route.middlewarePattern] = {
       accepts: {
         scheme: "exact",
         network,
-        price: route.price,
+        // Batch price scales with the request: $0.003/token, capped at
+        // $0.020 (x402 v2 dynamic pricing). Single route stays flat.
+        price: isBatch
+          ? async (ctx: Parameters<typeof batchTokenCount>[0]) =>
+              batchPrice(await batchTokenCount(ctx))
+          : route.price,
         payTo,
       },
       // `resource` is intentionally omitted: v2 treats it as the resource
@@ -447,19 +484,28 @@ function getPaymentMiddleware(env: Env): ReturnType<typeof paymentMiddleware> {
       tags: SERVICE_TAGS,
       description: route.description,
       mimeType: "application/json",
-      extensions: buildDiscoveryExtension(route),
+      extensions: isBatch
+        ? buildDiscoveryExtension(route)
+        : {
+            ...buildDiscoveryExtension(route),
+            // SIWx sessions on the single-token route only: its resource URL
+            // is token-specific, so "paid wallets re-read the same resource
+            // free for a while" cannot leak across different inputs the way
+            // it would on the batch route's shared URL.
+            ...declareSIWxExtension({
+              statement:
+                "Sign in to Token Intel API to re-read analyses you already paid for.",
+            }),
+          },
       // Mirror accepts[] into the 402 body so callers that only read JSON
       // (e.g. x402scan validators, naive curl checks) see the same payment
       // requirements they would otherwise pull from PAYMENT-REQUIRED header.
-      unpaidResponseBody: () => ({
-        contentType: "application/json",
-        body: {
-          x402Version: 2,
-          accepts,
-          error:
-            "Payment required: send an x402 payment via the PAYMENT-SIGNATURE header (requirements in the PAYMENT-REQUIRED header and accepts[] above).",
-        },
-      }),
+      unpaidResponseBody: isBatch
+        ? async (ctx: Parameters<typeof batchTokenCount>[0]) =>
+            unpaidBody(
+              buildAccepts(batchPrice(await batchTokenCount(ctx)), env),
+            )
+        : () => unpaidBody(buildAccepts(route.price, env)),
     };
   }
 

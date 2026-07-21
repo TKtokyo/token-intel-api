@@ -35,6 +35,7 @@ import {
 import {
   getResourceServer,
   buildAccepts,
+  batchPrice,
   SERVICE_NAME,
   SERVICE_TAGS,
   PRICE_SINGLE,
@@ -109,7 +110,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   {
     name: "analyze_tokens_batch",
     description:
-      `Batch security analysis for up to 10 EVM tokens in one request. Returns per-token results with security flags, risk scores, and summaries. Paid tool: ${PRICE_BATCH} USDC per call via x402 (payment handled in-protocol; x402-aware MCP clients pay automatically).`,
+      `Batch security analysis for up to 10 EVM tokens in one request. Returns per-token results with security flags, risk scores, and summaries. Paid tool: $0.003 USDC per token, capped at ${PRICE_BATCH}, via x402 (payment handled in-protocol; x402-aware MCP clients pay automatically).`,
     price: PRICE_BATCH,
     inputSchema: {
       type: "object" as const,
@@ -277,8 +278,23 @@ function makeBatchHandler(
  * wrappers themselves are cheap closures created per request so they can
  * capture env and waitUntil.
  */
+/**
+ * Price a tool call. The batch tool uses dynamic pricing ($0.003/token,
+ * capped at $0.020) based on the actual arguments of this call; unparseable
+ * arguments price at the cap and then fail validation (payment cancelled,
+ * not settled).
+ */
+function toolCallPrice(tool: McpToolDef, args: Record<string, unknown>): string {
+  if (tool.name !== "analyze_tokens_batch") {
+    return tool.price;
+  }
+  const tokens = args.tokens;
+  return batchPrice(Array.isArray(tokens) ? tokens.length : 10);
+}
+
 function buildToolCallbacks(
   env: Env,
+  args: Record<string, unknown>,
   waitUntil?: (p: Promise<unknown>) => void,
 ): Record<string, MCPToolCallback> {
   const handlers: Record<
@@ -293,8 +309,8 @@ function buildToolCallbacks(
   if (env.DISABLE_PAYWALL === "true") {
     const passthrough: Record<string, MCPToolCallback> = {};
     for (const [name, handler] of Object.entries(handlers)) {
-      passthrough[name] = async (args) =>
-        (await handler(args)) as WrappedToolResult;
+      passthrough[name] = async (callArgs) =>
+        (await handler(callArgs)) as WrappedToolResult;
     }
     return passthrough;
   }
@@ -303,7 +319,7 @@ function buildToolCallbacks(
   const callbacks: Record<string, MCPToolCallback> = {};
   for (const tool of MCP_TOOLS) {
     const paid = createPaymentWrapper(server, {
-      accepts: buildAccepts(tool.price, env) as never,
+      accepts: buildAccepts(toolCallPrice(tool, args), env) as never,
       resource: {
         url: `mcp://tool/${tool.name}`,
         description: tool.description,
@@ -374,7 +390,7 @@ async function handleJsonRpcRequest(
         };
       }
 
-      const callbacks = buildToolCallbacks(env, waitUntil);
+      const callbacks = buildToolCallbacks(env, p.arguments ?? {}, waitUntil);
       try {
         const result = await callbacks[toolName](p.arguments ?? {}, {
           _meta: p._meta,
