@@ -7,6 +7,10 @@ export interface Env {
   // CDP keys for mainnet facilitator (optional, testnet needs no auth)
   CDP_API_KEY_ID?: string;
   CDP_API_KEY_SECRET?: string;
+  // Robinhood Chain (eip155:4663) only: bytes32 serviceId issued by the
+  // Canopy facilitator's Discovery registration. Payments on 4663 cannot
+  // verify without it (the Permit2 witness binds payTo + serviceId).
+  CANOPY_SERVICE_ID?: string;
   DISABLE_PAYWALL?: string;
   // Public browser-visible origin, used for SIWx domain/URI binding.
   // Falls back to http://localhost:8787 for local dev.

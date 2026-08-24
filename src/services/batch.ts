@@ -6,7 +6,21 @@ import type {
 } from "../types/index.js";
 import { fetchTokenSecurity } from "./goplus.js";
 
-export const ALLOWED_CHAINS = ["1", "8453"];
+// GoPlus-supported analysis chains. Single source of truth: the validation
+// allowlist, the docs/OpenAPI/MCP enums, and their human-readable labels are
+// all derived from this map — add the next chain here and nowhere else.
+export const CHAIN_LABELS: Record<string, string> = {
+  "1": "Ethereum",
+  "8453": "Base",
+  "4663": "Robinhood Chain",
+};
+
+export const ALLOWED_CHAINS = Object.keys(CHAIN_LABELS);
+
+/** e.g. "Chain ID (1 = Ethereum, 8453 = Base, 4663 = Robinhood Chain)" */
+export const CHAIN_ENUM_DESCRIPTION = `Chain ID (${ALLOWED_CHAINS.map(
+  (id) => `${id} = ${CHAIN_LABELS[id]}`,
+).join(", ")})`;
 export const MAX_TOKENS = 10;
 const MAX_CONCURRENCY = 3;
 const TIMEOUT_MS = 8000;

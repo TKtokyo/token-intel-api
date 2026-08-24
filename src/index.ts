@@ -6,6 +6,11 @@ import type { Env } from "./types/index.js";
 import { tokenRoutes } from "./routes/token.js";
 import { tokensRoutes } from "./routes/tokens.js";
 import {
+  ALLOWED_CHAINS,
+  CHAIN_LABELS,
+  CHAIN_ENUM_DESCRIPTION,
+} from "./services/batch.js";
+import {
   handleMcpRequest,
   MCP_TOOLS,
   buildMcpDiscoveryExtension,
@@ -17,6 +22,9 @@ import {
   batchPrice,
   getResourceServer,
   envCacheKey,
+  paymentScheme,
+  settlementLabel,
+  settlementSymbol,
   SERVICE_NAME,
   SERVICE_TAGS,
   PRICE_SINGLE,
@@ -68,8 +76,8 @@ const TOKEN_ROUTES: Record<string, TokenRouteDef> = {
       properties: {
         chainId: {
           type: "string",
-          enum: ["1", "8453"],
-          description: "Chain ID (1 = Ethereum, 8453 = Base)",
+          enum: ALLOWED_CHAINS,
+          description: CHAIN_ENUM_DESCRIPTION,
         },
         address: {
           type: "string",
@@ -159,8 +167,8 @@ const TOKEN_ROUTES: Record<string, TokenRouteDef> = {
             properties: {
               chainId: {
                 type: "string",
-                enum: ["1", "8453"],
-                description: "Chain ID (1 = Ethereum, 8453 = Base)",
+                enum: ALLOWED_CHAINS,
+                description: CHAIN_ENUM_DESCRIPTION,
               },
               address: {
                 type: "string",
@@ -296,6 +304,8 @@ app.get("/", (c) =>
     price: {
       single: PRICE_SINGLE,
       batch: `$0.003/token, capped at ${PRICE_BATCH}`,
+      currency: settlementSymbol(c.env),
+      settlement: settlementLabel(c.env),
     },
     siwx: "Paid wallets can re-read the same single-token resource free for 1h (SIGN-IN-WITH-X header)",
     example: "/api/v1/token/1/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
@@ -309,9 +319,27 @@ app.get("/", (c) =>
   }),
 );
 
-// OpenAPI spec (unprotected)
+// OpenAPI spec (unprotected). The static OPENAPI_SPEC is deployment-neutral;
+// servers[], contact, and the x-x402 payment metadata are patched here so
+// each deployment (Base worker vs Robinhood worker) describes itself instead
+// of serving a copy of the Base production document.
 app.get("/openapi.json", (c) => {
-  return c.json(OPENAPI_SPEC, 200, {
+  const baseUrl = new URL(c.req.url).origin;
+  const spec = structuredClone(OPENAPI_SPEC) as Record<string, any>;
+  spec.servers = [
+    { url: baseUrl, description: `Production — ${settlementLabel(c.env)}` },
+  ];
+  spec.info.contact.url = `${baseUrl}/llms.txt`;
+  const symbol = settlementSymbol(c.env);
+  const x402Meta = (price: string) => ({
+    price: `${price} ${symbol}`,
+    network: c.env.X402_NETWORK,
+    facilitator: c.env.FACILITATOR_URL,
+  });
+  spec.paths["/api/v1/token/{chainId}/{address}"].get["x-x402"] =
+    x402Meta(PRICE_SINGLE);
+  spec.paths["/api/v1/tokens"].post["x-x402"] = x402Meta(`${PRICE_BATCH} max`);
+  return c.json(spec, 200, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
   });
@@ -319,23 +347,30 @@ app.get("/openapi.json", (c) => {
 
 // llms.txt (unprotected)
 app.get("/llms.txt", (c) => {
+  const currency = settlementSymbol(c.env);
+  // Request origin, not a hardcoded URL: each deployment (Base worker,
+  // Robinhood worker) must link to its own spec/manifest/MCP endpoints.
+  const baseUrl = new URL(c.req.url).origin;
+  const chainList = ALLOWED_CHAINS.map(
+    (id) => `"${id}" (${CHAIN_LABELS[id]})`,
+  ).join(", ");
   const body = `# Token Intel API
 > EVM token security analysis with deterministic risk scoring and natural language summaries via x402 micropayments.
 
 ## Endpoints
-- GET /api/v1/token/{chainId}/{address} — Analyze a single EVM token ($0.005 USDC, x402). Wallets that paid can re-read the same resource free for 1 hour via SIGN-IN-WITH-X.
-- POST /api/v1/tokens — Batch-analyze up to 10 EVM tokens in one request ($0.003 USDC per token, capped at $0.020, x402)
+- GET /api/v1/token/{chainId}/{address} — Analyze a single EVM token ($0.005 ${currency}, x402). Wallets that paid can re-read the same resource free for 1 hour via SIGN-IN-WITH-X.
+- POST /api/v1/tokens — Batch-analyze up to 10 EVM tokens in one request ($0.003 ${currency} per token, capped at $0.020, x402)
 
-Both paid endpoints run on Base mainnet. chainId is "1" (Ethereum) or "8453" (Base); address is the ERC-20 contract.
+Both paid endpoints settle on ${settlementLabel(c.env)}. chainId is ${chainList}; address is the ERC-20 contract.
 
 ## Machine-readable API spec
-- OpenAPI 3.0: https://token-intel-api.tatsu77.workers.dev/openapi.json
+- OpenAPI 3.0: ${baseUrl}/openapi.json
 
 ## Discovery
-- x402 manifest: https://token-intel-api.tatsu77.workers.dev/.well-known/x402
+- x402 manifest: ${baseUrl}/.well-known/x402
 
 ## MCP
-- Streamable HTTP: https://token-intel-api.tatsu77.workers.dev/mcp
+- Streamable HTTP: ${baseUrl}/mcp
 - Paid tools with in-protocol x402 payment: analyze_token ($0.005), analyze_tokens_batch ($0.020). x402-aware MCP clients (@x402/mcp) pay automatically via params._meta["x402/payment"].
 `;
   return c.text(body, 200, {
@@ -467,7 +502,9 @@ function getPaymentMiddleware(env: Env): ReturnType<typeof paymentMiddleware> {
     const isBatch = route.method === "POST";
     routes[route.middlewarePattern] = {
       accepts: {
-        scheme: "exact",
+        // "exact" (EIP-3009 USDC) on Base; "exact-permit2-v2" (Permit2 USDG
+        // via Canopy) on Robinhood Chain.
+        scheme: paymentScheme(env),
         network,
         // Batch price scales with the request: $0.003/token, capped at
         // $0.020 (x402 v2 dynamic pricing). Single route stays flat.

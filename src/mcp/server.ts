@@ -30,6 +30,7 @@ import {
   validateBatchTokens,
   runBatch,
   ALLOWED_CHAINS,
+  CHAIN_ENUM_DESCRIPTION,
   ADDRESS_PATTERN,
 } from "../services/batch.js";
 import {
@@ -81,14 +82,14 @@ export const MCP_TOOLS: McpToolDef[] = [
   {
     name: "analyze_token",
     description:
-      `EVM token security analysis with risk scoring. Returns security flags, holder info, liquidity data, risk score (0-100), and a human-readable summary. Paid tool: ${PRICE_SINGLE} USDC per call via x402 (payment handled in-protocol; x402-aware MCP clients pay automatically).`,
+      `EVM token security analysis with risk scoring. Returns security flags, holder info, liquidity data, risk score (0-100), and a human-readable summary. Paid tool: ${PRICE_SINGLE} per call via x402 in the deployment's settlement stablecoin — USDC on Base, USDG on Robinhood Chain (payment handled in-protocol; x402-aware MCP clients pay automatically).`,
     price: PRICE_SINGLE,
     inputSchema: {
       type: "object" as const,
       properties: {
         chainId: {
           type: "string",
-          description: "Chain ID: '1' for Ethereum, '8453' for Base",
+          description: CHAIN_ENUM_DESCRIPTION,
           enum: ALLOWED_CHAINS,
         },
         address: {
@@ -110,7 +111,7 @@ export const MCP_TOOLS: McpToolDef[] = [
   {
     name: "analyze_tokens_batch",
     description:
-      `Batch security analysis for up to 10 EVM tokens in one request. Returns per-token results with security flags, risk scores, and summaries. Paid tool: $0.003 USDC per token, capped at ${PRICE_BATCH}, via x402 (payment handled in-protocol; x402-aware MCP clients pay automatically).`,
+      `Batch security analysis for up to 10 EVM tokens in one request. Returns per-token results with security flags, risk scores, and summaries. Paid tool: $0.003 per token, capped at ${PRICE_BATCH}, via x402 in the deployment's settlement stablecoin — USDC on Base, USDG on Robinhood Chain (payment handled in-protocol; x402-aware MCP clients pay automatically).`,
     price: PRICE_BATCH,
     inputSchema: {
       type: "object" as const,
@@ -123,7 +124,7 @@ export const MCP_TOOLS: McpToolDef[] = [
             properties: {
               chainId: {
                 type: "string",
-                description: "Chain ID: '1' for Ethereum, '8453' for Base",
+                description: CHAIN_ENUM_DESCRIPTION,
                 enum: ALLOWED_CHAINS,
               },
               address: {

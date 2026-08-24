@@ -1,3 +1,8 @@
+import { ALLOWED_CHAINS, CHAIN_ENUM_DESCRIPTION } from "./services/batch.js";
+
+// Deployment-neutral base document. servers[], info.contact, and the x-x402
+// blocks are placeholders: the /openapi.json handler in index.ts patches them
+// per deployment (origin, network, facilitator, settlement currency).
 export const OPENAPI_SPEC = {
   openapi: "3.0.0",
   info: {
@@ -20,14 +25,18 @@ export const OPENAPI_SPEC = {
       get: {
         summary: "EVM Token Security Analysis",
         description:
-          "Returns deterministic risk score (0-100) and natural language summary for any EVM token. Requires x402 payment of $0.005 USDC on Base mainnet.",
+          "Returns deterministic risk score (0-100) and natural language summary for any EVM token. Requires x402 payment of $0.005 — USDC on the Base deployment, USDG on the Robinhood Chain deployment.",
         parameters: [
           {
             name: "chainId",
             in: "path",
             required: true,
-            description: "EVM chain ID (1 = Ethereum, 8453 = Base)",
-            schema: { type: "string", enum: ["1", "8453"], example: "1" },
+            description: CHAIN_ENUM_DESCRIPTION,
+            schema: {
+              type: "string",
+              enum: ALLOWED_CHAINS,
+              example: "1",
+            },
           },
           {
             name: "address",
@@ -71,9 +80,9 @@ export const OPENAPI_SPEC = {
           },
         },
         "x-x402": {
-          price: "$0.005 USDC",
-          network: "base",
-          facilitator: "Coinbase CDP",
+          price: "$0.005 (USDC on Base, USDG on Robinhood Chain)",
+          network: "base | robinhood",
+          facilitator: "Coinbase CDP (Base) | Canopy (Robinhood Chain)",
         },
       },
     },
@@ -81,7 +90,7 @@ export const OPENAPI_SPEC = {
       post: {
         summary: "Batch EVM Token Security Analysis",
         description:
-          "Analyze up to 10 EVM tokens in a single request. Returns partial results if the 8-second timeout is reached. Requires x402 payment of $0.020 USDC on Base mainnet.",
+          "Analyze up to 10 EVM tokens in a single request. Returns partial results if the 8-second timeout is reached. Requires x402 payment of $0.003 per token, capped at $0.020 — USDC on the Base deployment, USDG on the Robinhood Chain deployment.",
         requestBody: {
           required: true,
           content: {
@@ -100,8 +109,8 @@ export const OPENAPI_SPEC = {
                       properties: {
                         chainId: {
                           type: "string",
-                          enum: ["1", "8453"],
-                          description: "Chain ID (1 = Ethereum, 8453 = Base)",
+                          enum: ALLOWED_CHAINS,
+                          description: CHAIN_ENUM_DESCRIPTION,
                         },
                         address: {
                           type: "string",
@@ -182,9 +191,9 @@ export const OPENAPI_SPEC = {
           },
         },
         "x-x402": {
-          price: "$0.020 USDC",
-          network: "base",
-          facilitator: "Coinbase CDP",
+          price: "$0.020 max (USDC on Base, USDG on Robinhood Chain)",
+          network: "base | robinhood",
+          facilitator: "Coinbase CDP (Base) | Canopy (Robinhood Chain)",
         },
       },
     },

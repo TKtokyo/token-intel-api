@@ -28,6 +28,30 @@ PUBLIC_ORIGIN = "https://token-intel-api.tatsu77.workers.dev"
 binding = "TOKEN_CACHE"
 id = "4b1304f9c29d43e7b1970852cd69c8eb"
 
+# --- Robinhood Chain environment: eip155:4663, USDG via Canopy facilitator ---
+#
+# Payments settle in USDG (6 decimals, like USDC) through Canopy's
+# exact-permit2-v2 scheme. Deploy sequence:
+#   1. `wrangler deploy --env robinhood` (402s advertise the scheme, but
+#      payments cannot verify yet — serviceId missing)
+#   2. Register the deployed URL via Canopy `POST /discovery/register`;
+#      Canopy fetches the URL, confirms the 402, and issues a bytes32 serviceId
+#   3. `wrangler secret put CANOPY_SERVICE_ID --env robinhood`, then redeploy
+[env.robinhood]
+name = "token-intel-api-robinhood"
+
+[env.robinhood.vars]
+FACILITATOR_URL = "https://facilitator.canopyfinance.io"
+X402_NETWORK = "eip155:4663"
+PUBLIC_ORIGIN = "https://token-intel-api-robinhood.tatsu77.workers.dev"
+
+# Shares the production KV namespace: GoPlus cache entries are keyed by
+# chain+address (chain-agnostic win) and SIWx sessions bind to the full
+# resource URL, so the two workers cannot collide.
+[[env.robinhood.kv_namespaces]]
+binding = "TOKEN_CACHE"
+id = "4b1304f9c29d43e7b1970852cd69c8eb"
+
 # Secrets (set via `wrangler secret put`):
 # PAY_TO_ADDRESS = "0x..."
 # GOPLUS_API_KEY = "..."
@@ -35,3 +59,8 @@ id = "4b1304f9c29d43e7b1970852cd69c8eb"
 # Production-only (set via `wrangler secret put --env production`):
 # CDP_API_KEY_ID = "..."
 # CDP_API_KEY_SECRET = "..."
+#
+# Robinhood-only (set via `wrangler secret put --env robinhood`):
+# PAY_TO_ADDRESS = "0x..."   # receives USDG on Robinhood Chain
+# GOPLUS_API_KEY = "..."
+# CANOPY_SERVICE_ID = "0x..."  # bytes32 from Canopy Discovery registration

@@ -10,7 +10,7 @@ tokenRoutes.get("/:chainId/:address", async (c) => {
   const chainId = c.req.param("chainId");
   const rawAddress = c.req.param("address");
 
-  // Input validation: chainId allowlist (MVP: Ethereum + Base only)
+  // Input validation: chainId allowlist (Ethereum, Base, Robinhood Chain)
   if (!ALLOWED_CHAINS.includes(chainId)) {
     return c.json(
       {
