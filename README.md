@@ -1,8 +1,10 @@
 # Token Intelligence API
 
+> **Discontinued (October 2026).** This service has been shut down and its hosted endpoint is no longer available. The repository is archived and kept for reference only; it is not maintained.
+
 x402-powered paid API that returns security analysis, deterministic risk scores, and natural language summaries for any EVM token.
 
-**Live (mainnet):** `https://token-intel-api.tatsu77.workers.dev`
+**Former endpoint (offline):** `https://token-intel-api.tatsu77.workers.dev`
 
 ## How It Works
 
